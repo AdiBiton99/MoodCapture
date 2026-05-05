@@ -40,12 +40,89 @@ PROJECT1/
 
 ## התקנה והרצה
 
-```bash
+### דרישות מקדימות
+
+- **Python 3.10–3.12** (נבדק עם Python 3.10.11). אין להשתמש ב-3.13+ — `tensorflow` ו-`mediapipe` עדיין לא תומכים.
+- **Git** (להורדת הקוד).
+- **Windows / macOS / Linux** — הפרויקט נבדק ב-Windows 11 + PowerShell.
+
+#### בדיקת גרסת Python במחשב
+
+ב-Windows, בדקי דרך ה-Python launcher (`py`) ולא דרך `python` — ב-Windows 11 הפקודה `python` מצביעה כברירת מחדל ל-stub של Microsoft Store שלא ירוץ:
+
+```powershell
+py -0           # מציג את כל גרסאות Python המותקנות
+py -3.10 --version
+```
+
+אם אין Python 3.10–3.12 מותקן, להוריד מ-[python.org/downloads](https://www.python.org/downloads/).
+
+---
+
+### התקנה ב-Windows (PowerShell)
+
+```powershell
+git clone https://github.com/AdiBiton99/MoodCapture.git
+cd MoodCapture
+
+py -3.10 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-python main.py                 # DeepFace + ממשק
-python main.py --once          # ניתוח חד-פעמי בטרמינל
+```
+
+> אם `Activate.ps1` נכשל עם שגיאת **ExecutionPolicy**, להריץ פעם אחת:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+> כדי שעברית תוצג נכון בקונסול:
+> ```powershell
+> chcp 65001
+> $env:PYTHONUTF8 = "1"
+> ```
+
+---
+
+### התקנה ב-Linux / macOS
+
+```bash
+git clone https://github.com/AdiBiton99/MoodCapture.git
+cd MoodCapture
+
+python3.10 -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+---
+
+### הרצה
+
+לפני כל הרצה — לוודא שה-venv פעיל (תופיע התווית `(.venv)` בתחילת השורה).
+
+```bash
+python main.py                 # DeepFace + ממשק UI עם כפתור צילום ובחירת אזור
+python main.py --once          # ניתוח חד-פעמי בטרמינל ללא UI
 python main.py --mode fusion   # דורש models/fusion_model.pkl לאחר אימון
 ```
+
+> בהפעלה ראשונה, DeepFace יוריד מודלים מאומנים (~100MB) לתיקייה `~/.deepface/`. ההורדה הזו רצה פעם אחת.
+
+---
+
+### פתרון בעיות נפוצות
+
+| בעיה | פתרון |
+|---|---|
+| `python` רק מדפיס "Python" ויוצא | זה ה-stub של Microsoft Store. להשתמש ב-`py -3.10` במקום, או לכבות אותו ב-Settings → Apps → "App execution aliases" |
+| `Activate.ps1 cannot be loaded because running scripts is disabled` | `Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned` |
+| `ModuleNotFoundError` כלשהו אחרי התקנה | לוודא שה-venv פעיל (`.\.venv\Scripts\Activate.ps1`) ושהפקודה `python` מצביעה ל-`.venv\Scripts\python.exe` |
+| עברית בקונסול מופיעה כ-`???` | `chcp 65001` ו-`$env:PYTHONUTF8 = "1"` (או להפעיל UTF-8 גלובלי ב-Windows Settings) |
+| התקנת `tensorflow` נכשלת | ודאי שאת על Python 3.10–3.12 ועל מערכת 64-bit |
 
 ---
 

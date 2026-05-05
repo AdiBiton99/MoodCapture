@@ -1,0 +1,85 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / build
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checking
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temporary
+*.log
+logs/
+tmp/
+temp/
+
+# DeepFace / model caches downloaded at runtime
+.deepface/
+~/.deepface/
+
+# Project-specific large/binary artifacts
+# (models/ is whitelisted below to keep trained model files tracked)
+*.h5
+*.pb
+*.onnx
+*.tflite
+*.ckpt
+*.pkl
+!models/**
+
+# Captures / debug outputs
+captures/
+debug_output/
+*.png
+*.jpg
+*.jpeg
+!**/assets/**
+!**/docs/**

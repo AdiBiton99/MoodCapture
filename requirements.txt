@@ -1,12 +1,48 @@
-# Project dependencies
-opencv-python>=4.8.0
-numpy>=1.24.0
-mtcnn>=0.1.1
-tensorflow>=2.13.0
-deepface>=0.0.79
-mss>=9.0.1
-Pillow>=10.0.0
-PyQt5>=5.15.0
-scikit-image>=0.21.0
-mediapipe
-tf-keras
+# =============================================================================
+# MoodCapture — תלויות הפרויקט
+# פרויקט גמר — עדי ביטון ותמירה אוחנה
+# =============================================================================
+#
+# דורש Python 3.10–3.12 (נבדק עם Python 3.10.11 ב-Windows 11).
+# אין להשתמש ב-Python 3.13+ — TensorFlow / MediaPipe עדיין לא תומכים.
+#
+# התקנה מהירה (PowerShell ב-Windows):
+#   py -3.10 -m venv .venv
+#   .\.venv\Scripts\Activate.ps1
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# התקנה מהירה (bash ב-Linux/macOS):
+#   python3.10 -m venv .venv
+#   source .venv/bin/activate
+#   python -m pip install --upgrade pip
+#   pip install -r requirements.txt
+#
+# הוראות מלאות יותר ב-README.md.
+# =============================================================================
+
+# --- Computer Vision & numerics ---------------------------------------------
+opencv-python==4.13.0.92
+numpy==2.2.6
+Pillow==12.2.0
+scikit-image==0.25.2
+
+# --- Face detection ----------------------------------------------------------
+mtcnn==1.0.0
+
+# --- Face mesh (MediaPipe) ---------------------------------------------------
+mediapipe==0.10.35
+
+# --- Deep learning backend ---------------------------------------------------
+# tf-keras נדרש כדי ש-DeepFace יעבוד עם TensorFlow 2.16+ (Keras 3).
+tensorflow==2.21.0
+tf-keras==2.21.0
+
+# --- Emotion recognition -----------------------------------------------------
+deepface==0.0.99
+
+# --- Screen capture ----------------------------------------------------------
+mss==10.2.0
+
+# --- GUI ---------------------------------------------------------------------
+PyQt5==5.15.11
