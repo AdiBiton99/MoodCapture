@@ -4,15 +4,23 @@ main.py — נקודת הכניסה הראשית של מערכת MoodCapture
     מסך → ScreenCapturer
          → ImagePreprocessor
          → MTCNNFaceDetector
-         → EmotionPredictor (DeepFace)
+         → FusionEmotionModel (DeepFace + MediaPipe) / EmotionPredictor (fallback)
          → MultiFaceEmotionAggregator
          → EmotionOverlay (UI)
 
 הרצה:
     python main.py         ← UI עם כפתור צילום
     python main.py --once  ← ניתוח צילום מסך אחד בטרמינל
+
+מצב Fusion:
+    אם קיים models/fusion_model.pkl → נטען FusionEmotionModel
+    אחרת → DeepFace בלבד (ברירת מחדל)
+    לאמן מודל Fusion:
+        python ml/build_fusion_dataset.py
+        python ml/train_fusion_model.py
 """
 
+import os
 import sys
 import argparse
 
@@ -23,15 +31,29 @@ from screen_emotion.multi_face_aggregator import MultiFaceEmotionAggregator
 from screen_emotion.emotion_analysis_service import EmotionAnalysisService
 from capture.screen_capture import capture_screen
 
+_FUSION_MODEL_PATH = "models/fusion_model.pkl"
+
 
 def build_analysis_service() -> EmotionAnalysisService:
-    """יוצר EmotionAnalysisService עם כל הרכיבים מחוברים."""
+    """
+    יוצר EmotionAnalysisService עם כל הרכיבים מחוברים.
+
+    בוחר אוטומטית בין Fusion ל-DeepFace:
+        — אם models/fusion_model.pkl קיים → FusionEmotionModel
+        — אחרת → EmotionPredictor (DeepFace בלבד)
+    """
     preprocessor  = ImagePreprocessor()
     face_detector = MTCNNFaceDetector()
-    emotion_model = EmotionPredictor(model_path=None)
     aggregator    = MultiFaceEmotionAggregator()
 
-    print("מצב: DeepFace")
+    if os.path.exists(_FUSION_MODEL_PATH):
+        from screen_emotion.fusion_emotion_model import FusionEmotionModel
+        emotion_model = FusionEmotionModel(model_path=_FUSION_MODEL_PATH)
+        print("מצב: Fusion (DeepFace + MediaPipe Geometric)")
+    else:
+        emotion_model = EmotionPredictor(model_path=None)
+        print("מצב: DeepFace  (fusion_model.pkl לא נמצא — הרץ ml/train_fusion_model.py)")
+
     return EmotionAnalysisService(
         preprocessor=preprocessor,
         face_detector=face_detector,
