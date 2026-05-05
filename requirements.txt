@@ -1,0 +1,12 @@
+# Project dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+mtcnn>=0.1.1
+tensorflow>=2.13.0
+deepface>=0.0.79
+mss>=9.0.1
+Pillow>=10.0.0
+PyQt5>=5.15.0
+scikit-image>=0.21.0
+mediapipe
+tf-keras
