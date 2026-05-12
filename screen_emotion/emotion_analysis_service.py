@@ -5,7 +5,7 @@ emotion_analysis_service.py — צינור מלא מצילום מסך לניתו
     מקבל תמונה (צילום מסך) ומפעיל את השלבים בסדר:
 
         צילום מסך → ImagePreprocessor → MTCNNFaceDetector → חיתוך פנים עם שוליים
-        → EmotionPredictor / FusionEmotionModel → MultiFaceEmotionAggregator → dict
+        → EmotionPredictor → MultiFaceEmotionAggregator → dict
 
     עקרון Dependency Injection:
         EmotionAnalysisService מקבל את כל הרכיבים בבנאי — ניתן להחליף מודל או מזהה פנים בנפרד.
@@ -38,7 +38,7 @@ class EmotionAnalysisService:
         פרמטרים:
             preprocessor   — אובייקט ImagePreprocessor עם מתודת process(image)
             face_detector  — לרוב MTCNNFaceDetector עם detect(image) → list[DetectedFace]
-            emotion_model  — EmotionPredictor או FusionEmotionModel עם predict(...)
+            emotion_model  — EmotionPredictor עם predict(...)
             aggregator     — MultiFaceEmotionAggregator עם aggregate(predictions)
 
         דוגמה לשימוש:
@@ -79,6 +79,9 @@ class EmotionAnalysisService:
         # ═══ שלב 1: עיבוד מקדים ═══
         # resize + blur — מכין את התמונה לזיהוי פנים
         preprocessed_image = self._preprocessor.process(raw_image)
+        bbox_scale_x, bbox_scale_y = self._analysis_to_raw_scales(
+            raw_image, preprocessed_image
+        )
 
         # ═══ שלב 2: זיהוי פנים ═══
         # MTCNN מחפש פנים ומחזיר רשימת DetectedFace
@@ -96,11 +99,42 @@ class EmotionAnalysisService:
         all_predictions = [result["prediction"] for result in per_face_results]
         final_emotion, final_confidence = self._aggregator.aggregate(all_predictions)
 
-        return self._build_final_result(per_face_results, final_emotion, final_confidence)
+        return self._build_final_result(
+            per_face_results,
+            final_emotion,
+            final_confidence,
+            bbox_scale_x,
+            bbox_scale_y,
+        )
 
     # ------------------------------------------------------------------
     # מתודות עזר פנימיות
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _analysis_to_raw_scales(
+        raw_image: np.ndarray,
+        processed_image: np.ndarray,
+    ) -> tuple[float, float]:
+        raw_h, raw_w = raw_image.shape[:2]
+        proc_h, proc_w = processed_image.shape[:2]
+        scale_x = raw_w / proc_w if proc_w else 1.0
+        scale_y = raw_h / proc_h if proc_h else 1.0
+        return scale_x, scale_y
+
+    @staticmethod
+    def _scale_bbox(
+        bbox: tuple[int, int, int, int],
+        scale_x: float,
+        scale_y: float,
+    ) -> tuple[int, int, int, int]:
+        x, y, width, height = bbox
+        return (
+            int(round(x * scale_x)),
+            int(round(y * scale_y)),
+            int(round(width * scale_x)),
+            int(round(height * scale_y)),
+        )
 
     def _crop_and_analyze_each_face(
         self,
@@ -144,6 +178,8 @@ class EmotionAnalysisService:
         per_face_results: list[dict],
         final_emotion: str,
         final_confidence: float,
+        bbox_scale_x: float = 1.0,
+        bbox_scale_y: float = 1.0,
     ) -> dict:
         """
         בונה את מילון התוצאה הסופי שיחזור לקורא.
@@ -165,7 +201,9 @@ class EmotionAnalysisService:
                 "emotion":      emotion,
                 "confidence":   round(confidence, 4),
                 "all_emotions": face_result.get("all_emotions", {}),
-                "bbox":         face_result["bbox"],
+                "bbox":         self._scale_bbox(
+                    face_result["bbox"], bbox_scale_x, bbox_scale_y
+                ),
                 "face_image":   face_result.get("face_image"),
             })
 

@@ -4,19 +4,19 @@
 # =============================================================================
 #
 # דורש Python 3.10–3.12 (נבדק עם Python 3.10.11 ב-Windows 11).
-# אין להשתמש ב-Python 3.13+ — TensorFlow / MediaPipe עדיין לא תומכים.
+# אין להשתמש ב-Python 3.13+ — TensorFlow עדיין לא תומך.
 #
 # התקנה מהירה (PowerShell ב-Windows):
 #   py -3.10 -m venv .venv
 #   .\.venv\Scripts\Activate.ps1
 #   python -m pip install --upgrade pip
-#   pip install -r requirements.txt
+#   python -m pip install -r requirements.txt
 #
 # התקנה מהירה (bash ב-Linux/macOS):
 #   python3.10 -m venv .venv
 #   source .venv/bin/activate
 #   python -m pip install --upgrade pip
-#   pip install -r requirements.txt
+#   python -m pip install -r requirements.txt
 #
 # הוראות מלאות יותר ב-README.md.
 # =============================================================================
@@ -25,13 +25,10 @@
 opencv-python==4.13.0.92
 numpy==2.2.6
 Pillow==12.2.0
-scikit-image==0.25.2
+scikit-learn==1.6.1
 
 # --- Face detection ----------------------------------------------------------
 mtcnn==1.0.0
-
-# --- Face mesh (MediaPipe) ---------------------------------------------------
-mediapipe==0.10.35
 
 # --- Deep learning backend ---------------------------------------------------
 # tf-keras נדרש כדי ש-DeepFace יעבוד עם TensorFlow 2.16+ (Keras 3).

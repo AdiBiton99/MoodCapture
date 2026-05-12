@@ -1204,8 +1204,8 @@ class BBoxScreenOverlay(QWidget):
             # קואורדינטות bbox בשטח התמונה → שטח מסך לוגי
             sx = self._scale_x if self._scale_x > 0 else 1.0
             sy = self._scale_y if self._scale_y > 0 else 1.0
-            fx = int(bbox[0] * sx) + self._offset_x
-            fy = int(bbox[1] * sy) + self._offset_y
+            fx = int((bbox[0] + self._offset_x) * sx)
+            fy = int((bbox[1] + self._offset_y) * sy)
             fw = int(bbox[2] * sx)
             fh = int(bbox[3] * sy)
             if idx == 0:
@@ -1314,7 +1314,7 @@ class EmotionOverlay(QWidget):
 
     # signals — בטוחים לשליחה מ-thread אחר
     _sig_update_results = pyqtSignal(dict)
-    _sig_display_image  = pyqtSignal(object, list, int, int)   # image, faces, offset_x, offset_y
+    _sig_display_image  = pyqtSignal(object, list, int, int, int, int)
     _sig_reset          = pyqtSignal()
 
     def __init__(self):
@@ -1324,6 +1324,7 @@ class EmotionOverlay(QWidget):
         self._last_screenshot: "np.ndarray | None" = None
         self._last_faces:  list = []
         self._last_offset: tuple = (0, 0)
+        self._last_reference_size: tuple = (0, 0)
         self._worker: "_AnalysisWorker | None" = None
 
         self._setup_window()
@@ -1402,10 +1403,22 @@ class EmotionOverlay(QWidget):
     # ── API ציבורי — thread-safe ────────────
 
     def display_image(self, image: np.ndarray, faces: list = None,
-                      region_offset: tuple = (0, 0)) -> None:
+                      region_offset: tuple = (0, 0),
+                      reference_size: tuple | None = None) -> None:
         """שומר את הצילום + offset של אזור הלכידה — thread-safe."""
         ox, oy = (region_offset or (0, 0))
-        self._sig_display_image.emit(image, faces or [], int(ox), int(oy))
+        if image is not None and image.size:
+            ref_w, ref_h = reference_size or (image.shape[1], image.shape[0])
+        else:
+            ref_w, ref_h = reference_size or (0, 0)
+        self._sig_display_image.emit(
+            image,
+            faces or [],
+            int(ox),
+            int(oy),
+            int(ref_w),
+            int(ref_h),
+        )
 
     def update_results(self, results: dict) -> None:
         """מציג פאנל תוצאות — thread-safe."""
@@ -1418,10 +1431,12 @@ class EmotionOverlay(QWidget):
     # ── slots פנימיים (תמיד ב-main thread) ─
 
     def _do_display_image(self, image: np.ndarray, faces: list,
-                          offset_x: int, offset_y: int) -> None:
+                          offset_x: int, offset_y: int,
+                          reference_width: int, reference_height: int) -> None:
         self._last_screenshot = image
         self._last_faces      = faces or []
         self._last_offset     = (offset_x, offset_y)
+        self._last_reference_size = (reference_width, reference_height)
 
     def _do_update_results(self, results: dict) -> None:
         # פאנל צדדי מוסתר — רק תיבות זיהוי על המסך
@@ -1431,22 +1446,22 @@ class EmotionOverlay(QWidget):
         if faces:
             ox, oy = self._last_offset
             screen   = QApplication.primaryScreen()
-            dpr      = screen.devicePixelRatio()
             scr_geo  = screen.geometry()
             img      = self._last_screenshot
             img_w    = img.shape[1] if img is not None else 0
             img_h    = img.shape[0] if img is not None else 0
+            ref_w, ref_h = self._last_reference_size
+            if not ref_w or not ref_h:
+                ref_w, ref_h = img_w, img_h
             ovl_geo  = self._bbox_overlay.geometry()
             print(f"[DEBUG] screen={scr_geo.width()}x{scr_geo.height()} "
-                  f"DPR={dpr:.2f} img={img_w}x{img_h} "
+                  f"img={img_w}x{img_h} ref={ref_w}x{ref_h} "
                   f"overlay={ovl_geo.width()}x{ovl_geo.height()} "
                   f"offset=({ox},{oy})")
             print(f"[DEBUG] raw bboxes={[f.get('bbox') for f in faces]}")
 
-            # סקייל: bbox בקואורדינטות התמונה המעובדת → קואורדינטות מסך לוגיות
-            # preprocessor מכוון ל-max 1920×1080; הbeat בפועל מגיע מהתמונה המצולמת
-            sx = scr_geo.width()  / img_w if img_w else 1.0
-            sy = scr_geo.height() / img_h if img_h else 1.0
+            sx = scr_geo.width() / ref_w if ref_w else 1.0
+            sy = scr_geo.height() / ref_h if ref_h else 1.0
             print(f"[DEBUG] scale_x={sx:.4f} scale_y={sy:.4f}")
 
             self._bbox_overlay.show_faces(
