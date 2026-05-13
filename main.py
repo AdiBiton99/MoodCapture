@@ -24,6 +24,7 @@ from screen_emotion.face_detection import MTCNNFaceDetector
 from screen_emotion.emotion_predictor import EmotionPredictor
 from screen_emotion.multi_face_aggregator import MultiFaceEmotionAggregator
 from screen_emotion.emotion_analysis_service import EmotionAnalysisService
+from screen_emotion.emotion_explanation_service import EmotionExplanationService
 from capture.screen_capture import capture_screen
 
 
@@ -37,11 +38,25 @@ def build_emotion_model(mode: str, ensemble_weight: float, finetuned_path: str):
         return EmotionPredictor(model_path=None)
 
     if mode == "finetuned":
+        if not os.path.exists(finetuned_path):
+            print(
+                f"[WARNING] Fine-tuned model not found at: {finetuned_path}\n"
+                f"  Falling back to DeepFace.\n"
+                f"  To train the model once, run: python ml/train_finetune_model.py"
+            )
+            return EmotionPredictor(model_path=None)
         from screen_emotion.finetuned_emotion_model import FinetunedEmotionModel
         print("מצב: Fine-tuned (MobileNetV2)")
         return FinetunedEmotionModel(finetuned_path)
 
     if mode == "ensemble":
+        if not os.path.exists(finetuned_path):
+            print(
+                f"[WARNING] Fine-tuned model not found at: {finetuned_path}\n"
+                f"  Ensemble requires the fine-tuned model — falling back to DeepFace.\n"
+                f"  To train the model once, run: python ml/train_finetune_model.py"
+            )
+            return EmotionPredictor(model_path=None)
         from screen_emotion.finetuned_emotion_model import FinetunedEmotionModel
         from screen_emotion.ensemble_emotion_model import EnsembleEmotionModel
         print("מצב: Ensemble (DeepFace + Fine-tuned)")
@@ -102,14 +117,182 @@ def run_once(mode: str, ensemble_weight: float, finetuned_path: str) -> None:
 def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> None:
     """מריץ UI (EmotionOverlay) עם כפתור צילום מסך ובחירת אזור."""
     from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtCore import QThread, QTimer, pyqtSignal
     from ui.overlay_ui import EmotionOverlay
 
     print("Building analysis pipeline...")
     service = build_analysis_service(mode, ensemble_weight, finetuned_path)
 
+    # ── Explainable AI Emotion Assistant ──────────────────────────────
+    # Built once at startup. OpenAIService loads .env (if available) and
+    # silently falls back to a local explanation when no key is configured
+    # or the API call fails — this keeps the existing pipeline working
+    # regardless of network or credentials.
+    try:
+        from services.openai_service import OpenAIService
+        openai_service = OpenAIService()
+        print(
+            "Explainable AI: OpenAI enabled"
+            if openai_service.is_available()
+            else f"Explainable AI: local-only mode ({openai_service.status()})"
+        )
+    except Exception as e:
+        print(f"Explainable AI: OpenAI client unavailable ({e}). Using local fallback.")
+        openai_service = None
+
+    explanation_service = EmotionExplanationService(openai_service=openai_service)
+
     app     = QApplication(sys.argv)
     overlay = EmotionOverlay()
     overlay.show()
+
+    # Watchdog timeout — if no result for a given tab within this many ms,
+    # force the deterministic local fallback. Protects against API hangs.
+    _EXPLAIN_WATCHDOG_MS = 22_000
+
+    # Per-analysis state. seq monotonically increases so stale results from
+    # an older capture are dropped. `cache` holds the explanation text per
+    # target_id (e.g. "overall", "face:0", "face:1", ...) so switching tabs
+    # is instant and free after the first generation.
+    _explain_state = {
+        "seq":     0,
+        "results": None,
+        "cache":   {},     # target_id -> str
+        "workers": [],     # keep refs so QThread isn't GC'd mid-run
+    }
+
+    def _face_context(results: dict, idx: int) -> dict:
+        """Build the `context` argument for explain_face()."""
+        return {
+            "final_emotion":    results.get("final_emotion"),
+            "final_confidence": float(results.get("confidence", 0.0) or 0.0),
+            "faces_count":      len(results.get("faces", []) or []),
+            "face_index":       idx,
+        }
+
+    def _explain_target(target_id: str, results: dict, *,
+                        openai_service_override=None) -> str:
+        """Synchronously generate the explanation for a given tab target."""
+        svc = (EmotionExplanationService(openai_service=openai_service_override)
+               if openai_service_override is not None
+               else explanation_service)
+        if target_id == "overall":
+            return svc.explain(results)
+        try:
+            idx = int(target_id.split(":", 1)[1])
+            face = results["faces"][idx]
+        except (KeyError, IndexError, ValueError):
+            return "The selected face is no longer available."
+        return svc.explain_face(face, _face_context(results, idx))
+
+    class _ExplainWorker(QThread):
+        finished_text = pyqtSignal(int, str, str)  # seq, target_id, text
+        failed         = pyqtSignal(int, str, str)  # seq, target_id, error
+
+        def __init__(self, seq: int, target_id: str, results: dict):
+            super().__init__()
+            self._seq       = seq
+            self._target_id = target_id
+            self._results   = results
+
+        def run(self) -> None:
+            try:
+                text = _explain_target(self._target_id, self._results)
+            except Exception as exc:
+                self.failed.emit(self._seq, self._target_id, str(exc))
+                return
+            self.finished_text.emit(self._seq, self._target_id, text or "")
+
+    def _on_worker_done(seq: int, target_id: str, text: str) -> None:
+        if seq != _explain_state["seq"]:
+            return  # superseded by a newer capture
+        if not text:
+            return
+        _explain_state["cache"][target_id] = text
+        # Only refresh the body if the user is still viewing this tab.
+        if overlay.get_active_explanation_tab() == target_id:
+            overlay.update_explanation(text)
+
+    def _on_worker_failed(seq: int, target_id: str, err: str) -> None:
+        if seq != _explain_state["seq"]:
+            return
+        print(f"[ExplainAI] worker failed ({target_id}): {err}")
+        # Use the deterministic local fallback so the user still sees a sentence.
+        try:
+            text = _explain_target(target_id, _explain_state["results"],
+                                   openai_service_override=None)
+        except Exception:
+            text = "The explanation could not be generated for this selection."
+        _explain_state["cache"][target_id] = text
+        if overlay.get_active_explanation_tab() == target_id:
+            overlay.update_explanation(text)
+
+    def _watchdog_fire(seq: int, target_id: str) -> None:
+        """Force the local fallback if nothing arrived in time for this tab."""
+        if seq != _explain_state["seq"]:
+            return
+        if target_id in _explain_state["cache"]:
+            return  # already delivered
+        print(f"[ExplainAI] watchdog (seq={seq}, tab={target_id}) — local fallback")
+        try:
+            text = _explain_target(target_id, _explain_state["results"],
+                                   openai_service_override=None)
+        except Exception as exc:
+            print(f"[ExplainAI] watchdog fallback failed: {exc}")
+            text = "The explanation could not be generated in time."
+        _explain_state["cache"][target_id] = text
+        if overlay.get_active_explanation_tab() == target_id:
+            overlay.update_explanation(text)
+
+    def _request_target(target_id: str) -> None:
+        """Spawn a worker for `target_id` (no-op if already cached)."""
+        if target_id in _explain_state["cache"]:
+            if overlay.get_active_explanation_tab() == target_id:
+                overlay.update_explanation(_explain_state["cache"][target_id])
+            return
+        seq = _explain_state["seq"]
+        results = _explain_state["results"]
+        if results is None:
+            return
+        worker = _ExplainWorker(seq, target_id, results)
+        worker.finished_text.connect(_on_worker_done)
+        worker.failed.connect(_on_worker_failed)
+        _explain_state["workers"].append(worker)
+        worker.start()
+        QTimer.singleShot(
+            _EXPLAIN_WATCHDOG_MS,
+            lambda s=seq, t=target_id: _watchdog_fire(s, t),
+        )
+
+    def _start_explanation(results: dict) -> None:
+        """
+        Connected to `overlay.analysis_completed` — runs in MAIN thread.
+        Resets state and primes the card with a hint. No API call is made
+        until the user clicks a face on the screen.
+        """
+        _explain_state["seq"]    += 1
+        _explain_state["results"] = results
+        _explain_state["cache"]   = {}
+        _explain_state["workers"] = []
+        overlay.prepare_explanation(results)
+
+    def _on_face_requested(target_id: str) -> None:
+        """
+        User clicked a tab in the card. The card has already updated its
+        chip + tab highlight on the UI side; we just need to refresh the body.
+        """
+        if _explain_state["results"] is None:
+            return
+        if target_id in _explain_state["cache"]:
+            overlay.update_explanation(_explain_state["cache"][target_id])
+        else:
+            overlay.show_explanation_loading()
+            _request_target(target_id)
+
+    # Wire up: when the overlay finishes rendering analysis results in the
+    # main thread, kick off the Explainable AI pipeline (also in main thread).
+    overlay.analysis_completed.connect(_start_explanation)
+    overlay.face_explanation_requested.connect(_on_face_requested)
 
     def _analyze_and_display(screenshot, region_offset=(0, 0), reference_size=None):
         try:
@@ -121,6 +304,10 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
                 region_offset=region_offset,
                 reference_size=reference_size,
             )
+            # `update_results` is queued to the main thread. After it renders,
+            # EmotionOverlay emits `analysis_completed`, which fires
+            # `_start_explanation` (connected above) IN THE MAIN THREAD —
+            # the right place to spawn the QTimer watchdog.
             overlay.update_results(results)
             n   = len(results.get("faces", []))
             emo = results.get("final_emotion", "none")

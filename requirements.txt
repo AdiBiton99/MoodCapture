@@ -43,3 +43,13 @@ mss==10.2.0
 
 # --- GUI ---------------------------------------------------------------------
 PyQt5==5.15.11
+
+# --- Optional: Explainable AI Emotion Assistant ------------------------------
+# הרכיב "Explainable AI" משתמש ב-OpenAI כדי להסביר *למה* נבחר רגש מסוים.
+# שתי החבילות הבאות הן אופציונליות — אם הן לא מותקנות (או שאין OPENAI_API_KEY
+# בקובץ .env) המערכת עוברת אוטומטית להסבר מקומי דטרמיניסטי שמבוסס על אותם
+# מספרים מהמודל, ללא קריסה. כדי להפעיל מצב OpenAI:
+#     1. python -m pip install openai python-dotenv
+#     2. cp .env.example .env  ולעדכן OPENAI_API_KEY בקובץ .env
+openai>=1.0
+python-dotenv>=1.0

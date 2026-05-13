@@ -25,6 +25,30 @@ API ציבורי (תואם main.py):
 import sys
 import cv2
 import numpy as np
+
+# ──────────────────────────────────────────
+# Foreground-window watching (Windows only)
+# ──────────────────────────────────────────
+# Used to auto-hide bboxes + card when the user switches away from the
+# application that was captured. No-op on non-Windows.
+if sys.platform == "win32":
+    import ctypes
+    try:
+        _USER32 = ctypes.windll.user32
+    except Exception:
+        _USER32 = None
+else:
+    _USER32 = None
+
+
+def _get_foreground_hwnd() -> int:
+    """Return the OS-level handle of the currently foreground window, or 0."""
+    if _USER32 is None:
+        return 0
+    try:
+        return int(_USER32.GetForegroundWindow())
+    except Exception:
+        return 0
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QFrame,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -38,7 +62,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import (
     QColor, QPainter, QBrush, QPen, QFont, QFontMetrics,
     QPixmap, QImage, QLinearGradient, QRadialGradient,
-    QPainterPath,
+    QPainterPath, QRegion,
 )
 
 
@@ -1101,19 +1125,22 @@ class AnnotatedImageViewer(QFrame):
 
 class BBoxScreenOverlay(QWidget):
     """
-    שכבת-על שקופה מלאת-מסך שמצייר תיבות זיהוי צבעוניות ישירות על המסך.
+    Transparent, full-screen overlay that draws face-detection bboxes on top
+    of whatever is on the screen.
 
-    • מופעלת אחרי ניתוח, עם offset לתמיכה ב-region captures.
-    • מציגה corner-brackets, צבע לפי רגש, label עם face ID + confidence.
-    • מתפוגגת בהדרגה (fade-out) ונעלמת אוטומטית.
+    Behavior:
+      * Stays visible until a new analysis replaces it or the app closes.
+      * Each bbox is CLICKABLE. Clicking emits `face_clicked(face_index)`.
+      * Outside the bbox regions, the window is invisible AND click-through
+        (achieved via setMask) so the user can still interact with the
+        underlying application (browser, Zoom, etc).
+      * Active (selected) bbox is rendered with thicker brackets + brighter
+        border to provide visual feedback.
     """
 
-    AUTO_HIDE_MS = 10_000   # מסתנכרן עם זמן הפאנל
-    FADE_STEP    = 0.05     # כמות אטימות לכל צעד (40 צעדים ≈ 1.2 שניות)
-    FADE_MS      = 30       # מרווח בין צעדי fade
+    face_clicked = pyqtSignal(int)
 
     def __init__(self):
-        # חלון עצמאי (top-level) שקוף — מקואורדינטות מסך מוחלטות
         super().__init__(
             None,
             Qt.FramelessWindowHint |
@@ -1121,9 +1148,11 @@ class BBoxScreenOverlay(QWidget):
             Qt.Tool,
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_NoSystemBackground)
-        # כיסוי מסך מלא
+        # NOTE: NO WA_TransparentForMouseEvents. We use setMask() so only
+        # the bbox rectangles receive clicks; everywhere else the window
+        # is masked out and clicks pass to the OS / underlying app.
+
         screen = QApplication.primaryScreen().geometry()
         self.setGeometry(screen)
 
@@ -1132,60 +1161,101 @@ class BBoxScreenOverlay(QWidget):
         self._offset_y: int   = 0
         self._scale_x:  float = 1.0
         self._scale_y:  float = 1.0
-        self._opacity:  float = 1.0
+        self._active_face_idx = None   # int or None
 
-        self._hide_timer = QTimer(self)
-        self._hide_timer.setSingleShot(True)
-        self._hide_timer.timeout.connect(self._start_fade)
-
-        self._fade_timer = QTimer(self)
-        self._fade_timer.setInterval(self.FADE_MS)
-        self._fade_timer.timeout.connect(self._fade_step)
-
+        self.setCursor(Qt.PointingHandCursor)
         self.hide()
 
-    # ── ממשק ציבורי ───────────────────────
+    # ── Public API ────────────────────────
 
     def show_faces(self, faces: list,
                    offset_x: int = 0, offset_y: int = 0,
                    scale_x: float = 1.0, scale_y: float = 1.0) -> None:
-        """מציג תיבות זיהוי על הפנים שזוהו."""
-        self._faces    = [f for f in faces if f.get("bbox")]
-        self._offset_x = offset_x
-        self._offset_y = offset_y
-        self._scale_x  = scale_x
-        self._scale_y  = scale_y
-        self._opacity  = 1.0
-        self._fade_timer.stop()
-        self._hide_timer.stop()
+        """Show bboxes for the given faces. Stays visible until cleared."""
+        self._faces            = [f for f in faces if f.get("bbox")]
+        self._offset_x         = offset_x
+        self._offset_y         = offset_y
+        self._scale_x          = scale_x
+        self._scale_y          = scale_y
+        self._active_face_idx  = None
+        self._refresh_mask()
         self.update()
-        self.show()
-        self.raise_()
         if self._faces:
-            self._hide_timer.start(self.AUTO_HIDE_MS)
+            self.show()
+            self.raise_()
+        else:
+            self.hide()
 
     def hide_faces(self) -> None:
-        """מסתיר מיד (ללא fade)."""
-        self._hide_timer.stop()
-        self._fade_timer.stop()
-        self._faces = []
+        """Hide all bboxes immediately."""
+        self._faces           = []
+        self._active_face_idx = None
+        self.clearMask()
         self.hide()
 
-    # ── fade ──────────────────────────────
+    def set_active_face_idx(self, idx) -> None:
+        """Programmatically mark a face as active (highlighted)."""
+        if idx == self._active_face_idx:
+            return
+        self._active_face_idx = idx
+        self.update()
 
-    def _start_fade(self) -> None:
-        self._fade_timer.start()
+    def get_active_face_idx(self):
+        return self._active_face_idx
 
-    def _fade_step(self) -> None:
-        self._opacity = max(0.0, self._opacity - self.FADE_STEP)
-        if self._opacity <= 0.0:
-            self._fade_timer.stop()
-            self.hide()
-            self._faces = []
-        else:
-            self.update()
+    # ── Geometry / mask ───────────────────
 
-    # ── ציור ──────────────────────────────
+    def _bbox_to_screen(self, bbox):
+        x, y, w, h = bbox[:4]
+        sx = self._scale_x if self._scale_x > 0 else 1.0
+        sy = self._scale_y if self._scale_y > 0 else 1.0
+        fx = int((x + self._offset_x) * sx)
+        fy = int((y + self._offset_y) * sy)
+        fw = int(w * sx)
+        fh = int(h * sy)
+        return fx, fy, fw, fh
+
+    def _refresh_mask(self) -> None:
+        """
+        Build a QRegion containing only the bbox rectangles (with a tiny
+        padding to safely cover the corner brackets). Areas outside this
+        region are click-through and invisible.
+        """
+        if not self._faces:
+            self.clearMask()
+            return
+        pad = 3
+        region = QRegion()
+        for face in self._faces:
+            bbox = face.get("bbox")
+            if not bbox:
+                continue
+            fx, fy, fw, fh = self._bbox_to_screen(bbox)
+            region = region.united(
+                QRegion(fx - pad, fy - pad, fw + 2 * pad, fh + 2 * pad)
+            )
+        self.setMask(region)
+
+    # ── Mouse ─────────────────────────────
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        pos = event.pos()
+        for idx, face in enumerate(self._faces):
+            bbox = face.get("bbox")
+            if not bbox:
+                continue
+            fx, fy, fw, fh = self._bbox_to_screen(bbox)
+            if fx <= pos.x() <= fx + fw and fy <= pos.y() <= fy + fh:
+                self.set_active_face_idx(idx)
+                self.face_clicked.emit(idx)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    # ── Painting ──────────────────────────
 
     def paintEvent(self, event) -> None:
         if not self._faces:
@@ -1194,46 +1264,39 @@ class BBoxScreenOverlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         p.setRenderHint(QPainter.TextAntialiasing)
-        p.setOpacity(self._opacity)
 
         for idx, face in enumerate(self._faces):
             bbox = face.get("bbox")
             if not bbox or len(bbox) < 4:
                 continue
 
-            # קואורדינטות bbox בשטח התמונה → שטח מסך לוגי
-            sx = self._scale_x if self._scale_x > 0 else 1.0
-            sy = self._scale_y if self._scale_y > 0 else 1.0
-            fx = int((bbox[0] + self._offset_x) * sx)
-            fy = int((bbox[1] + self._offset_y) * sy)
-            fw = int(bbox[2] * sx)
-            fh = int(bbox[3] * sy)
-            if idx == 0:
-                print(f"[PAINT] Face1 drawn at screen ({fx},{fy},{fw},{fh})"
-                      f" overlay_geo={self.geometry().x()},{self.geometry().y()}"
-                      f" size={self.width()}x{self.height()}")
+            fx, fy, fw, fh = self._bbox_to_screen(bbox)
 
-            emotion  = (face.get("emotion") or "unknown").lower()
-            conf     = face.get("confidence", 0.0)
-            hex_col  = EMOTION_COLORS.get(emotion, C_PRIMARY)
-            color    = QColor(hex_col)
+            emotion   = (face.get("emotion") or "unknown").lower()
+            conf      = face.get("confidence", 0.0)
+            hex_col   = EMOTION_COLORS.get(emotion, C_PRIMARY)
+            color     = QColor(hex_col)
+            is_active = (idx == self._active_face_idx)
 
-            # ── תיבת זיהוי ───────────────
-            # מילוי רקע עדין
+            # ── Fill ──
             fill = QColor(color)
-            fill.setAlpha(18)
+            fill.setAlpha(40 if is_active else 18)
             p.fillRect(QRectF(fx, fy, fw, fh), fill)
 
-            # מסגרת דקה שקופה למחצה
-            p.setPen(QPen(QColor(hex_col + "88"), 2.0))
+            # ── Full-rect border ──
+            border_pen = QPen(
+                QColor(hex_col + ("CC" if is_active else "88")),
+                3.0 if is_active else 2.0,
+            )
+            p.setPen(border_pen)
             p.setBrush(Qt.NoBrush)
             p.drawRoundedRect(QRectF(fx, fy, fw, fh), 6, 6)
 
-            # פינות L עבות (corner brackets)
+            # ── Corner brackets ──
             bk = max(14, min(fw, fh) // 6)
-            pen = QPen(color, 3.5)
-            pen.setCapStyle(Qt.RoundCap)
-            p.setPen(pen)
+            bracket = QPen(color, 5.0 if is_active else 3.5)
+            bracket.setCapStyle(Qt.RoundCap)
+            p.setPen(bracket)
             for (x0, y0, x1, y1) in [
                 (fx + bk, fy,       fx,       fy),
                 (fx,      fy,       fx,       fy + bk),
@@ -1246,47 +1309,33 @@ class BBoxScreenOverlay(QWidget):
             ]:
                 p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
 
-            # ── תווית מעל התיבה ──────────
-            face_lbl = f"Face {idx + 1}"
-            conf_lbl = f"{emotion.capitalize()}  {conf:.0%}"
+            # ── Compact label INSIDE the bbox (top-left). No "Face N". ──
+            conf_text = f"{emotion.capitalize()}  {conf:.0%}"
+            fnt = QFont("Segoe UI", 9)
+            fnt.setWeight(QFont.Bold)
+            fm  = QFontMetrics(fnt)
 
-            fnt_b = QFont("Segoe UI", 9)
-            fnt_b.setWeight(QFont.Bold)
-            fnt_r = QFont("Segoe UI", 8)
-            fm_b  = QFontMetrics(fnt_b)
-            fm_r  = QFontMetrics(fnt_r)
+            tw = fm.horizontalAdvance(conf_text) + 18
+            th = fm.height() + 8
+            lx = fx + 6
+            ly = fy + 6
 
-            lw = max(fm_b.horizontalAdvance(face_lbl),
-                     fm_r.horizontalAdvance(conf_lbl)) + 20
-            lh = fm_b.height() + fm_r.height() + 12
-            lx = fx
-            ly = max(0, fy - lh - 6)
-
-            # רקע תווית עם שקיפות
             bg = QColor(C_PANEL)
-            bg.setAlpha(230)
+            bg.setAlpha(235)
             p.setPen(Qt.NoPen)
             p.setBrush(QBrush(bg))
-            p.drawRoundedRect(QRectF(lx, ly, lw, lh), 8, 8)
+            p.drawRoundedRect(QRectF(lx, ly, tw, th), 7, 7)
 
-            # פס צבע שמאלי
+            # color accent strip
             p.setBrush(QBrush(color))
-            p.drawRoundedRect(QRectF(lx, ly, 5, lh), 3, 3)
+            p.drawRoundedRect(QRectF(lx, ly, 4, th), 2, 2)
 
-            # Face N — bold, צבע הרגש
-            p.setFont(fnt_b)
-            p.setPen(color)
-            p.drawText(
-                QRectF(lx + 10, ly + 4, lw - 12, fm_b.height() + 2),
-                Qt.AlignLeft | Qt.AlignVCenter, face_lbl,
-            )
-
-            # Emotion XX% — רגיל, כהה
-            p.setFont(fnt_r)
+            p.setFont(fnt)
             p.setPen(QColor(C_TEXT))
             p.drawText(
-                QRectF(lx + 10, ly + fm_b.height() + 6, lw - 12, fm_r.height() + 2),
-                Qt.AlignLeft | Qt.AlignVCenter, conf_lbl,
+                QRectF(lx + 10, ly, tw - 12, th),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                conf_text,
             )
 
         p.end()
@@ -1316,6 +1365,17 @@ class EmotionOverlay(QWidget):
     _sig_update_results = pyqtSignal(dict)
     _sig_display_image  = pyqtSignal(object, list, int, int, int, int)
     _sig_reset          = pyqtSignal()
+    # Explainable AI Emotion Assistant — thread-safe signals
+    _sig_explain_loading = pyqtSignal(str, float)
+    _sig_explain_text    = pyqtSignal(str)
+    _sig_explain_error   = pyqtSignal(str)
+    _sig_explain_prepare = pyqtSignal(dict)
+    # Fires AFTER results are rendered, in the MAIN thread — safe place to
+    # spawn downstream work that needs a Qt event loop (e.g. QTimer watchdogs).
+    analysis_completed   = pyqtSignal(dict)
+    # Forwarded from ExplanationCard — emitted on USER tab clicks only.
+    # Payload is "overall" or "face:N".
+    face_explanation_requested = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -1327,6 +1387,13 @@ class EmotionOverlay(QWidget):
         self._last_reference_size: tuple = (0, 0)
         self._worker: "_AnalysisWorker | None" = None
 
+        # Auto-hide watcher: remembers which OS window was captured so the
+        # overlays vanish when the user switches to a different application.
+        self._captured_hwnd  = 0
+        self._fg_watch_timer = QTimer(self)
+        self._fg_watch_timer.setInterval(800)
+        self._fg_watch_timer.timeout.connect(self._check_foreground)
+
         self._setup_window()
         self._build_ui()
         self.setStyleSheet(GLOBAL_SS)
@@ -1335,6 +1402,11 @@ class EmotionOverlay(QWidget):
         self._sig_update_results.connect(self._do_update_results)
         self._sig_display_image.connect(self._do_display_image)
         self._sig_reset.connect(self._do_reset)
+        # Explainable AI — connect on main thread
+        self._sig_explain_loading.connect(self._do_explain_loading)
+        self._sig_explain_text.connect(self._do_explain_text)
+        self._sig_explain_error.connect(self._do_explain_error)
+        self._sig_explain_prepare.connect(self._do_explain_prepare)
 
     # ── הגדרת חלון ────────────────────────
 
@@ -1374,6 +1446,18 @@ class EmotionOverlay(QWidget):
 
         # שכבת תיבות זיהוי — חלון עצמאי שקוף מעל הכל
         self._bbox_overlay = BBoxScreenOverlay()
+
+        # Explainable AI — floating draggable explanation card
+        from ui.explanation_card import ExplanationCard
+        self._explanation = ExplanationCard(self)
+        # Route card tab clicks AND screen bbox clicks through the same
+        # handler so the bbox highlight and the card chip stay in sync,
+        # then forward to the controller (main.py).
+        self._explanation.face_selected.connect(self._on_card_tab_selected)
+        # When the user dismisses the card with ×, also clear the bboxes
+        # from the screen — the entire analysis goes away together.
+        self._explanation.closed.connect(self._on_explanation_closed)
+        self._bbox_overlay.face_clicked.connect(self._on_bbox_clicked)
 
         self._reposition_panel()
 
@@ -1428,6 +1512,49 @@ class EmotionOverlay(QWidget):
         """מאפס מצב עיבוד — thread-safe."""
         self._sig_reset.emit()
 
+    # ── Explainable AI public API — thread-safe ───────────
+
+    def prepare_explanation(self, results: dict) -> None:
+        """
+        Initialize the explanation card for a new analysis result.
+        Builds the tab strip and sets the active tab to 'overall'.
+        Thread-safe.
+        """
+        self._sig_explain_prepare.emit(results or {})
+
+    def show_explanation_loading(self, emotion: str = "", confidence: float = 0.0) -> None:
+        """
+        Open the explanation card body in 'generating...' state.
+
+        Args are optional (and ignored when the card was already prepared via
+        `prepare_explanation`) — they exist for legacy callers and tests.
+        Thread-safe.
+        """
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            conf = 0.0
+        self._sig_explain_loading.emit(emotion or "", conf)
+
+    def update_explanation(self, text: str) -> None:
+        """Replace the card's text with the final explanation. Thread-safe."""
+        self._sig_explain_text.emit(text or "")
+
+    def show_explanation_error(self, reason: str) -> None:
+        """Show a soft-error state on the card. Thread-safe."""
+        self._sig_explain_error.emit(reason or "Explanation unavailable.")
+
+    def hide_explanation(self) -> None:
+        """Force-hide the card from the main thread."""
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.hide_card()
+
+    def get_active_explanation_tab(self) -> str:
+        """Return the tab currently visible on the card ('overall' or 'face:N')."""
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            return self._explanation.get_active_tab()
+        return "overall"
+
     # ── slots פנימיים (תמיד ב-main thread) ─
 
     def _do_display_image(self, image: np.ndarray, faces: list,
@@ -1478,6 +1605,17 @@ class EmotionOverlay(QWidget):
         self.show()
         self.raise_()
 
+        # Start auto-close watching: hide overlays when the user switches
+        # away from the captured application.
+        if self._captured_hwnd and faces:
+            self._fg_watch_timer.start()
+
+        # Notify listeners (e.g. Explainable AI) — we are in the main thread.
+        try:
+            self.analysis_completed.emit(results)
+        except Exception as exc:
+            print(f"[overlay] analysis_completed emit failed: {exc}")
+
     def _reposition_viewer(self) -> None:
         """מציב את ה-viewer מעל פאנל התוצאות."""
         self._viewer.adjustSize()
@@ -1500,12 +1638,120 @@ class EmotionOverlay(QWidget):
     def _do_reset(self) -> None:
         self._btn.set_processing(False)
 
+    # ── Face selection routing (bbox click ↔ card tab) ────
+
+    def _on_explanation_closed(self) -> None:
+        """Card was dismissed by the user — also clear the bboxes."""
+        self._fg_watch_timer.stop()
+        self._captured_hwnd = 0
+        if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+            self._bbox_overlay.hide_faces()
+
+    # ── Foreground-window watcher ─────────────────────────
+
+    def _check_foreground(self) -> None:
+        """
+        Polled every ~800ms. If the user has switched to an application
+        other than the one we captured (and other than our own overlays),
+        auto-hide everything so we don't litter the screen.
+        """
+        if not self._captured_hwnd:
+            self._fg_watch_timer.stop()
+            return
+
+        current = _get_foreground_hwnd()
+        if not current:
+            return
+
+        # Collect handles for our own top-level windows — clicks/focus
+        # on the card or bboxes shouldn't trigger auto-close.
+        my_hwnds = set()
+        try:
+            my_hwnds.add(int(self.winId()))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+                my_hwnds.add(int(self._bbox_overlay.winId()))
+        except Exception:
+            pass
+
+        if current == self._captured_hwnd or current in my_hwnds:
+            return  # still on captured app or interacting with our overlay
+
+        self._auto_close_overlays("foreground window changed")
+
+    def _auto_close_overlays(self, reason: str) -> None:
+        """Hide all analysis overlays. Called by the foreground watcher."""
+        print(f"[overlay] auto-close ({reason})")
+        self._fg_watch_timer.stop()
+        self._captured_hwnd = 0
+        if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+            self._bbox_overlay.hide_faces()
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.hide_card()
+
+    def _on_bbox_clicked(self, idx: int) -> None:
+        """User clicked a face's bbox on the screen."""
+        target_id = f"face:{idx}"
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.set_active_tab(target_id)
+        # bbox already highlighted itself in its own mousePressEvent
+        self.face_explanation_requested.emit(target_id)
+
+    def _on_card_tab_selected(self, target_id: str) -> None:
+        """User clicked a visible tab inside the card (e.g. 'Overall')."""
+        # Card already updated its own active state + chip.
+        # Sync the bbox highlight.
+        if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+            if target_id == "overall":
+                self._bbox_overlay.set_active_face_idx(None)
+            elif target_id.startswith("face:"):
+                try:
+                    idx = int(target_id.split(":", 1)[1])
+                    self._bbox_overlay.set_active_face_idx(idx)
+                except ValueError:
+                    pass
+        self.face_explanation_requested.emit(target_id)
+
+    # ── Explainable AI slots (main thread) ────────────────
+
+    def _do_explain_prepare(self, results: dict) -> None:
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.prepare(results)
+        # New analysis → clear any previous bbox highlight ("Overall" view).
+        if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+            self._bbox_overlay.set_active_face_idx(None)
+
+    def _do_explain_loading(self, emotion: str, confidence: float) -> None:
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            # If the caller passed an emotion, also refresh the chip — this
+            # keeps the legacy signature alive for tests / direct callers.
+            if emotion:
+                self._explanation.show_loading(emotion, confidence)
+            else:
+                self._explanation.show_loading()
+
+    def _do_explain_text(self, text: str) -> None:
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.show_text(text)
+
+    def _do_explain_error(self, reason: str) -> None:
+        if hasattr(self, "_explanation") and self._explanation is not None:
+            self._explanation.show_error(reason)
+
     # ── callbacks ─────────────────────────
 
     def _on_capture(self) -> None:
         """לחיצה על כפתור צילום מסך."""
         if self._worker and self._worker.isRunning():
             return
+
+        # Snapshot the OS-level handle of whatever the user is looking at
+        # RIGHT NOW. Recorded before we hide anything; used by the
+        # foreground watcher to auto-close when she switches apps.
+        self._fg_watch_timer.stop()
+        self._captured_hwnd = _get_foreground_hwnd()
 
         self._panel.hide()
         # מסתירים רק את הכפתור (לא את כל ה-overlay) כדי שלא יופיע בצילום
