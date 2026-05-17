@@ -1217,22 +1217,47 @@ class BBoxScreenOverlay(QWidget):
 
     def _refresh_mask(self) -> None:
         """
-        Build a QRegion containing only the bbox rectangles (with a tiny
-        padding to safely cover the corner brackets). Areas outside this
-        region are click-through and invisible.
+        Build a QRegion containing the bbox rectangles AND each face's
+        in-bbox label area (so narrow bboxes don't clip the percentage
+        text). Areas outside this region are click-through and invisible.
         """
         if not self._faces:
             self.clearMask()
             return
         pad = 3
         region = QRegion()
-        for face in self._faces:
+
+        # Same font metrics used by paintEvent — keep them in sync so the
+        # mask exactly covers the label rectangle drawn later.
+        face_font = QFont("Segoe UI", 8)
+        face_font.setWeight(QFont.Bold)
+        emo_font  = QFont("Segoe UI", 9)
+        emo_font.setWeight(QFont.Bold)
+        fm_face = QFontMetrics(face_font)
+        fm_emo  = QFontMetrics(emo_font)
+
+        for idx, face in enumerate(self._faces):
             bbox = face.get("bbox")
             if not bbox:
                 continue
             fx, fy, fw, fh = self._bbox_to_screen(bbox)
             region = region.united(
                 QRegion(fx - pad, fy - pad, fw + 2 * pad, fh + 2 * pad)
+            )
+
+            emotion = (face.get("emotion") or "unknown").lower()
+            conf    = face.get("confidence", 0.0)
+            face_text = f"FACE {idx + 1}"
+            emo_text  = f"{emotion.capitalize()}  {conf:.0%}"
+            tw = max(
+                fm_face.horizontalAdvance(face_text),
+                fm_emo.horizontalAdvance(emo_text),
+            ) + 20
+            th = fm_face.height() + fm_emo.height() + 12
+            lx = fx + 6
+            ly = fy + 6
+            region = region.united(
+                QRegion(lx - pad, ly - pad, tw + 2 * pad, th + 2 * pad)
             )
         self.setMask(region)
 
@@ -1309,14 +1334,25 @@ class BBoxScreenOverlay(QWidget):
             ]:
                 p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
 
-            # ── Compact label INSIDE the bbox (top-left). No "Face N". ──
-            conf_text = f"{emotion.capitalize()}  {conf:.0%}"
-            fnt = QFont("Segoe UI", 9)
-            fnt.setWeight(QFont.Bold)
-            fm  = QFontMetrics(fnt)
+            # ── Two-line label INSIDE the bbox (top-left) ─────────
+            # Line 1: "FACE N" (so the user knows which face the AI is
+            #         referring to when explaining)
+            # Line 2: "<Emotion>  XX%"
+            face_text = f"FACE {idx + 1}"
+            emo_text  = f"{emotion.capitalize()}  {conf:.0%}"
 
-            tw = fm.horizontalAdvance(conf_text) + 18
-            th = fm.height() + 8
+            face_fnt = QFont("Segoe UI", 8)
+            face_fnt.setWeight(QFont.Bold)
+            emo_fnt  = QFont("Segoe UI", 9)
+            emo_fnt.setWeight(QFont.Bold)
+            fm_face = QFontMetrics(face_fnt)
+            fm_emo  = QFontMetrics(emo_fnt)
+
+            tw = max(
+                fm_face.horizontalAdvance(face_text),
+                fm_emo.horizontalAdvance(emo_text),
+            ) + 20
+            th = fm_face.height() + fm_emo.height() + 12
             lx = fx + 6
             ly = fy + 6
 
@@ -1330,12 +1366,22 @@ class BBoxScreenOverlay(QWidget):
             p.setBrush(QBrush(color))
             p.drawRoundedRect(QRectF(lx, ly, 4, th), 2, 2)
 
-            p.setFont(fnt)
+            # Line 1: FACE N (colored, smaller, uppercase tracking)
+            p.setFont(face_fnt)
+            p.setPen(color)
+            p.drawText(
+                QRectF(lx + 10, ly + 4, tw - 14, fm_face.height() + 2),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                face_text,
+            )
+
+            # Line 2: Emotion + confidence (dark, bold)
+            p.setFont(emo_fnt)
             p.setPen(QColor(C_TEXT))
             p.drawText(
-                QRectF(lx + 10, ly, tw - 12, th),
+                QRectF(lx + 10, ly + fm_face.height() + 6, tw - 14, fm_emo.height() + 2),
                 Qt.AlignLeft | Qt.AlignVCenter,
-                conf_text,
+                emo_text,
             )
 
         p.end()
@@ -1606,7 +1652,8 @@ class EmotionOverlay(QWidget):
         self.raise_()
 
         # Start auto-close watching: hide overlays when the user switches
-        # away from the captured application.
+        # away from the captured application (so the analysis doesn't follow
+        # the user across unrelated apps like Canva, browsers, etc).
         if self._captured_hwnd and faces:
             self._fg_watch_timer.start()
 
@@ -1722,6 +1769,7 @@ class EmotionOverlay(QWidget):
         # New analysis → clear any previous bbox highlight ("Overall" view).
         if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
             self._bbox_overlay.set_active_face_idx(None)
+        self._raise_card_above_bboxes()
 
     def _do_explain_loading(self, emotion: str, confidence: float) -> None:
         if hasattr(self, "_explanation") and self._explanation is not None:
@@ -1731,14 +1779,34 @@ class EmotionOverlay(QWidget):
                 self._explanation.show_loading(emotion, confidence)
             else:
                 self._explanation.show_loading()
+        self._raise_card_above_bboxes()
 
     def _do_explain_text(self, text: str) -> None:
         if hasattr(self, "_explanation") and self._explanation is not None:
             self._explanation.show_text(text)
+        self._raise_card_above_bboxes()
 
     def _do_explain_error(self, reason: str) -> None:
         if hasattr(self, "_explanation") and self._explanation is not None:
             self._explanation.show_error(reason)
+        self._raise_card_above_bboxes()
+
+    def _raise_card_above_bboxes(self) -> None:
+        """
+        Make sure the explanation card / EmotionOverlay window sits ABOVE
+        the (separate) BBoxScreenOverlay top-level window. Both windows are
+        always-on-top; without this, the newer / last-raised one ends up
+        on top, which can hide parts of the popup behind the bboxes.
+        """
+        try:
+            if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+                # Re-stack: bboxes first, then the popup on top of them.
+                self._bbox_overlay.raise_()
+            self.raise_()
+            if hasattr(self, "_explanation") and self._explanation is not None:
+                self._explanation.raise_()
+        except Exception as exc:
+            print(f"[overlay] raise card failed: {exc}")
 
     # ── callbacks ─────────────────────────
 

@@ -16,6 +16,7 @@ main.py — נקודת הכניסה הראשית של מערכת MoodCapture
     python main.py --model ensemble --ensemble-weight 0.6
 """
 
+import os
 import sys
 import argparse
 
