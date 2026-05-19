@@ -27,6 +27,12 @@ from mtcnn import MTCNN
 # ============================
 MINIMUM_FACE_SIZE_PIXELS = 20        # פנים קטנות מ-20x20 פיקסלים — נפסלות
 MINIMUM_DETECTION_CONFIDENCE = 0.60  # סף נמוך יותר — יזהה פנים עם תאורה חריגה/פילטרים
+# סף קצה: פנים שנוגעים בקצה התמונה (פחות מ-N פיקסלים מהקצה)
+# בדרך כלל פנים חצויים — האימוצי'ה לא אמינה ושני העיניים / הפה לא נראים במלואם
+EDGE_MARGIN_PIXELS = 4
+# סף "ניתוק" של פנים גדולים: אם הפנים גדולים אבל הם נוגעים בקצה,
+# רוב הסיכויים שהמסגרת לא מכילה את כל הפנים — נפסל גם כן.
+MIN_KEYPOINTS_INSIDE_RATIO = 1.0   # כל 5 נקודות העיגון חייבות להיות בתוך התמונה
 
 
 # ============================
@@ -185,19 +191,31 @@ class MTCNNFaceDetector:
         הסינון שמתבצע:
             1. פנים קטנות מדי — נפסלות
             2. פנים עם ביטחון זיהוי נמוך — נפסלות
+            3. פנים חצויים (נוגעים בקצה התמונה) — נפסלות, כי
+               האימוצי'ה לא אמינה כשרק חצי מהפנים נראה.
         """
         # הצינור שלנו מספק תמונה ב-RGB (מ-screen_capture).
         # MTCNN מצפה ל-RGB — אין צורך בהמרה.
         # ⚠️ אם קוראים ל-detect() עם תמונת OpenCV (BGR), יש להמיר לפני הקריאה.
         raw_detections = self._mtcnn_detector.detect_faces(image)
 
+        img_h, img_w = image.shape[:2]
+
         # המרה לאובייקטים + סינון
         valid_faces = []
         for raw_face in raw_detections:
             detected_face = DetectedFace.from_mtcnn_result(raw_face)
 
-            if self._is_face_valid(detected_face):
+            if self._is_face_valid(detected_face, img_w, img_h):
                 valid_faces.append(detected_face)
+            else:
+                print(
+                    f"[face_detect] dropped face "
+                    f"bbox=({detected_face.face_x},{detected_face.face_y},"
+                    f"{detected_face.face_width}x{detected_face.face_height}) "
+                    f"conf={detected_face.confidence:.2f} "
+                    f"(failed size/confidence/edge check)"
+                )
 
         return valid_faces
 
@@ -205,18 +223,50 @@ class MTCNNFaceDetector:
     # מתודות עזר פנימיות
     # ------------------------------------------------------------------
 
-    def _is_face_valid(self, face: DetectedFace) -> bool:
+    def _is_face_valid(self, face: DetectedFace,
+                       img_w: int, img_h: int) -> bool:
         """
-        בודק שהפנים עומדות בשני תנאים:
+        בודק שהפנים עומדות בכל התנאים:
             1. גדולות מספיק (לפחות minimum_face_size פיקסלים)
             2. ביטחון הזיהוי גבוה מספיק
-
-        פנים שלא עומדות בתנאים — לא מספיק ברורות לניתוח רגשות.
+            3. לא חצויים — כל המסגרת + כל נקודות העיגון בתוך התמונה
         """
         return (
             self._is_face_large_enough(face)
             and self._is_detection_confident_enough(face)
+            and self._is_face_fully_inside(face, img_w, img_h)
         )
+
+    def _is_face_fully_inside(self, face: DetectedFace,
+                              img_w: int, img_h: int) -> bool:
+        """
+        בודק שהפנים לא חצויים — המסגרת לא נוגעת בקצה התמונה
+        וכל נקודות העיגון (עיניים, אף, פינות פה) בתוך התמונה.
+
+        למה זה חשוב?
+            פנים שחצי מהם מחוץ למסך → הזיהוי הרגשי לא אמין
+            (חסר חצי מהפה / עין אחת). עדיף לוותר עליהם בכלל.
+        """
+        # מסגרת חייבת להיות עם מרווח מהקצה
+        x = face.face_x
+        y = face.face_y
+        w = face.face_width
+        h = face.face_height
+        if x < EDGE_MARGIN_PIXELS:
+            return False
+        if y < EDGE_MARGIN_PIXELS:
+            return False
+        if x + w > img_w - EDGE_MARGIN_PIXELS:
+            return False
+        if y + h > img_h - EDGE_MARGIN_PIXELS:
+            return False
+
+        # כל נקודות העיגון חייבות להיות בתוך התמונה
+        for kp_x, kp_y in face.keypoints.values():
+            if kp_x < 0 or kp_x >= img_w or kp_y < 0 or kp_y >= img_h:
+                return False
+
+        return True
 
     def _is_face_large_enough(self, face: DetectedFace) -> bool:
         """

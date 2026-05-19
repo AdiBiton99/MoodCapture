@@ -49,6 +49,33 @@ def _get_foreground_hwnd() -> int:
         return int(_USER32.GetForegroundWindow())
     except Exception:
         return 0
+
+
+def _get_window_title(hwnd: int) -> str:
+    """Return the title of an OS window handle, or empty string."""
+    if _USER32 is None or not hwnd:
+        return ""
+    try:
+        length = int(_USER32.GetWindowTextLengthW(hwnd))
+        if length <= 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        _USER32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
+def _get_window_process_id(hwnd: int) -> int:
+    """Return the OS process id that owns a given hwnd, or 0."""
+    if _USER32 is None or not hwnd:
+        return 0
+    try:
+        pid = ctypes.c_ulong(0)
+        _USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        return int(pid.value)
+    except Exception:
+        return 0
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QFrame,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -1120,6 +1147,85 @@ class AnnotatedImageViewer(QFrame):
 
 
 # ══════════════════════════════════════════
+# NoFacesToast — הודעת חיווי קצרה
+# ══════════════════════════════════════════
+
+class NoFacesToast(QFrame):
+    """
+    Small auto-hiding banner ("No faces detected on screen") shown
+    centered near the top of the screen when an analysis comes back
+    empty. Auto-disappears after `AUTO_HIDE_MS`. Stays out of the way
+    of the camera button.
+    """
+
+    AUTO_HIDE_MS = 3500
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+        wrap = QHBoxLayout(self)
+        wrap.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame()
+        card.setObjectName("NoFacesToastCard")
+        card.setStyleSheet(f"""
+            QFrame#NoFacesToastCard {{
+                background: {C_PANEL};
+                border: 1px solid {C_BORDER};
+                border-radius: 14px;
+            }}
+        """)
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(28)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QColor(0, 0, 0, 60))
+        card.setGraphicsEffect(shadow)
+
+        cv = QHBoxLayout(card)
+        cv.setContentsMargins(16, 12, 18, 12)
+        cv.setSpacing(10)
+
+        icon = QLabel("⚠")
+        icon.setStyleSheet(
+            f"font-size: 18px; color: {C_WARNING}; background: transparent;"
+        )
+        title = QLabel("No faces detected on the captured screen.")
+        title.setStyleSheet(
+            f"font-size: 12px; font-weight: 700; color: {C_TEXT};"
+            f"background: transparent;"
+        )
+        cv.addWidget(icon)
+        cv.addWidget(title)
+
+        wrap.addWidget(card)
+        self.adjustSize()
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.setInterval(self.AUTO_HIDE_MS)
+        self._hide_timer.timeout.connect(self.hide)
+        self.hide()
+
+    def pop(self) -> None:
+        """Show the toast and arm the auto-hide timer."""
+        self.adjustSize()
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = max(40, int(screen.height() * 0.08))
+        self.move(x, y)
+        self.show()
+        self.raise_()
+        self._hide_timer.start()
+
+
+# ══════════════════════════════════════════
 # BBoxScreenOverlay — תיבות זיהוי על המסך
 # ══════════════════════════════════════════
 
@@ -1215,26 +1321,78 @@ class BBoxScreenOverlay(QWidget):
         fh = int(h * sy)
         return fx, fy, fw, fh
 
+    def _label_geometry_for_face(self, idx: int, fx: int, fy: int,
+                                 fw: int, fh: int):
+        """
+        Return (lx, ly, tw, th, face_pt, emo_pt) for the in/around-bbox
+        label of face #`idx`. Geometry is computed *only* from the face
+        size, so very small bboxes get smaller fonts and labels placed
+        ABOVE the bbox (when space allows) so they don't cover the face.
+
+        Used by both `_refresh_mask` and `paintEvent` — they MUST agree
+        on the final rectangle, otherwise the label gets clipped.
+        """
+        face = self._faces[idx]
+        emotion = (face.get("emotion") or "unknown").lower()
+        conf    = face.get("confidence", 0.0)
+        face_text = f"FACE {idx + 1}"
+        emo_text  = f"{emotion.capitalize()}  {conf:.0%}"
+
+        face_size = max(20, min(fw, fh))
+        scale = max(0.55, min(1.0, face_size / 180.0))
+        face_pt = max(6, int(round(8 * scale)))
+        emo_pt  = max(7, int(round(9 * scale)))
+
+        face_fnt = QFont("Segoe UI", face_pt)
+        face_fnt.setWeight(QFont.Bold)
+        emo_fnt = QFont("Segoe UI", emo_pt)
+        emo_fnt.setWeight(QFont.Bold)
+        fm_face = QFontMetrics(face_fnt)
+        fm_emo  = QFontMetrics(emo_fnt)
+
+        pad_h = max(8, int(12 * scale))
+        pad_v = max(6, int(10 * scale))
+
+        tw = max(
+            fm_face.horizontalAdvance(face_text),
+            fm_emo.horizontalAdvance(emo_text),
+        ) + pad_h * 2
+        th = fm_face.height() + fm_emo.height() + pad_v
+
+        # Prefer placing the label ABOVE the bbox so it doesn't cover the
+        # actual face. If there is no room above (face is near top of
+        # screen), tuck it INSIDE the top-left corner instead.
+        screen_geo = self.geometry()
+        gap = 4
+        if fy - th - gap >= 0:
+            lx = fx
+            ly = fy - th - gap
+        elif fy + fh + th + gap <= screen_geo.height():
+            lx = fx
+            ly = fy + fh + gap
+        else:
+            lx = fx + 4
+            ly = fy + 4
+
+        # Keep label fully on-screen horizontally too
+        if lx + tw > screen_geo.width():
+            lx = max(0, screen_geo.width() - tw - 2)
+        if lx < 0:
+            lx = 0
+
+        return lx, ly, tw, th, face_pt, emo_pt
+
     def _refresh_mask(self) -> None:
         """
         Build a QRegion containing the bbox rectangles AND each face's
-        in-bbox label area (so narrow bboxes don't clip the percentage
-        text). Areas outside this region are click-through and invisible.
+        label area (computed by `_label_geometry_for_face`). Areas
+        outside this region are click-through and invisible.
         """
         if not self._faces:
             self.clearMask()
             return
         pad = 3
         region = QRegion()
-
-        # Same font metrics used by paintEvent — keep them in sync so the
-        # mask exactly covers the label rectangle drawn later.
-        face_font = QFont("Segoe UI", 8)
-        face_font.setWeight(QFont.Bold)
-        emo_font  = QFont("Segoe UI", 9)
-        emo_font.setWeight(QFont.Bold)
-        fm_face = QFontMetrics(face_font)
-        fm_emo  = QFontMetrics(emo_font)
 
         for idx, face in enumerate(self._faces):
             bbox = face.get("bbox")
@@ -1245,17 +1403,9 @@ class BBoxScreenOverlay(QWidget):
                 QRegion(fx - pad, fy - pad, fw + 2 * pad, fh + 2 * pad)
             )
 
-            emotion = (face.get("emotion") or "unknown").lower()
-            conf    = face.get("confidence", 0.0)
-            face_text = f"FACE {idx + 1}"
-            emo_text  = f"{emotion.capitalize()}  {conf:.0%}"
-            tw = max(
-                fm_face.horizontalAdvance(face_text),
-                fm_emo.horizontalAdvance(emo_text),
-            ) + 20
-            th = fm_face.height() + fm_emo.height() + 12
-            lx = fx + 6
-            ly = fy + 6
+            lx, ly, tw, th, _, _ = self._label_geometry_for_face(
+                idx, fx, fy, fw, fh
+            )
             region = region.united(
                 QRegion(lx - pad, ly - pad, tw + 2 * pad, th + 2 * pad)
             )
@@ -1263,21 +1413,32 @@ class BBoxScreenOverlay(QWidget):
 
     # ── Mouse ─────────────────────────────
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() != Qt.LeftButton:
-            super().mousePressEvent(event)
-            return
-        pos = event.pos()
+    def face_at_position(self, pos) -> "int | None":
+        """
+        Return the index of the face whose bbox contains the (screen-space)
+        point `pos`, or None if no bbox is hit. Used by `EmotionOverlay`
+        to forward clicks that the OS routed to the full-screen overlay
+        window instead of this masked one.
+        """
         for idx, face in enumerate(self._faces):
             bbox = face.get("bbox")
             if not bbox:
                 continue
             fx, fy, fw, fh = self._bbox_to_screen(bbox)
             if fx <= pos.x() <= fx + fw and fy <= pos.y() <= fy + fh:
-                self.set_active_face_idx(idx)
-                self.face_clicked.emit(idx)
-                event.accept()
-                return
+                return idx
+        return None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            super().mousePressEvent(event)
+            return
+        idx = self.face_at_position(event.pos())
+        if idx is not None:
+            self.set_active_face_idx(idx)
+            self.face_clicked.emit(idx)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     # ── Painting ──────────────────────────
@@ -1334,27 +1495,21 @@ class BBoxScreenOverlay(QWidget):
             ]:
                 p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
 
-            # ── Two-line label INSIDE the bbox (top-left) ─────────
+            # ── Two-line label (size + position scale with face) ──
             # Line 1: "FACE N" (so the user knows which face the AI is
             #         referring to when explaining)
             # Line 2: "<Emotion>  XX%"
             face_text = f"FACE {idx + 1}"
             emo_text  = f"{emotion.capitalize()}  {conf:.0%}"
-
-            face_fnt = QFont("Segoe UI", 8)
+            lx, ly, tw, th, face_pt, emo_pt = self._label_geometry_for_face(
+                idx, fx, fy, fw, fh
+            )
+            face_fnt = QFont("Segoe UI", face_pt)
             face_fnt.setWeight(QFont.Bold)
-            emo_fnt  = QFont("Segoe UI", 9)
+            emo_fnt  = QFont("Segoe UI", emo_pt)
             emo_fnt.setWeight(QFont.Bold)
             fm_face = QFontMetrics(face_fnt)
             fm_emo  = QFontMetrics(emo_fnt)
-
-            tw = max(
-                fm_face.horizontalAdvance(face_text),
-                fm_emo.horizontalAdvance(emo_text),
-            ) + 20
-            th = fm_face.height() + fm_emo.height() + 12
-            lx = fx + 6
-            ly = fy + 6
 
             bg = QColor(C_PANEL)
             bg.setAlpha(235)
@@ -1362,24 +1517,25 @@ class BBoxScreenOverlay(QWidget):
             p.setBrush(QBrush(bg))
             p.drawRoundedRect(QRectF(lx, ly, tw, th), 7, 7)
 
-            # color accent strip
             p.setBrush(QBrush(color))
             p.drawRoundedRect(QRectF(lx, ly, 4, th), 2, 2)
 
-            # Line 1: FACE N (colored, smaller, uppercase tracking)
+            text_x = lx + 8
+            text_w = tw - 12
+            text_top = ly + 3
             p.setFont(face_fnt)
             p.setPen(color)
             p.drawText(
-                QRectF(lx + 10, ly + 4, tw - 14, fm_face.height() + 2),
+                QRectF(text_x, text_top, text_w, fm_face.height() + 2),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 face_text,
             )
 
-            # Line 2: Emotion + confidence (dark, bold)
             p.setFont(emo_fnt)
             p.setPen(QColor(C_TEXT))
             p.drawText(
-                QRectF(lx + 10, ly + fm_face.height() + 6, tw - 14, fm_emo.height() + 2),
+                QRectF(text_x, text_top + fm_face.height() + 2,
+                       text_w, fm_emo.height() + 2),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 emo_text,
             )
@@ -1434,11 +1590,63 @@ class EmotionOverlay(QWidget):
         self._worker: "_AnalysisWorker | None" = None
 
         # Auto-hide watcher: remembers which OS window was captured so the
-        # overlays vanish when the user switches to a different application.
+        # overlays vanish when the user switches to a different application
+        # OR even to a different browser-tab (same hwnd, different title).
         self._captured_hwnd  = 0
+        self._captured_title = ""
+        self._captured_pid   = 0
+        # Continuous background poll: records the user's *external*
+        # foreground window every 250ms. This way, even when she clicks
+        # our floating button (which may briefly promote our overlay to
+        # the OS-foreground), we always know which "real" app she was
+        # looking at last. Used as a robust fallback in `_on_capture`
+        # and `_on_region`.
+        self._last_external_hwnd  = 0
+        self._last_external_title = ""
+        self._fg_poll_timer = QTimer(self)
+        self._fg_poll_timer.setInterval(250)
+        self._fg_poll_timer.timeout.connect(self._poll_external_foreground)
+        self._fg_poll_timer.start()
+
+        # Pixel-content watcher: detects when the captured region's
+        # underlying content changes (e.g. the user navigates to the
+        # next photo *in the same window*, so the hwnd / title don't
+        # change but the visible image does). When MAE between the
+        # current thumbnail and the reference exceeds a threshold, we
+        # auto-close the overlays.
+        self._pixel_reference: "np.ndarray | None" = None
+        self._pixel_check_region: "tuple[int, int, int, int] | None" = None
+        self._pixel_check_timer = QTimer(self)
+        self._pixel_check_timer.setInterval(1500)
+        self._pixel_check_timer.timeout.connect(self._check_pixel_change)
+
         self._fg_watch_timer = QTimer(self)
-        self._fg_watch_timer.setInterval(800)
+        self._fg_watch_timer.setInterval(400)
         self._fg_watch_timer.timeout.connect(self._check_foreground)
+        # Hard safety-net: hide overlays after this many ms no matter what.
+        self._fg_max_timer = QTimer(self)
+        self._fg_max_timer.setSingleShot(True)
+        self._fg_max_timer.setInterval(25_000)
+        self._fg_max_timer.timeout.connect(
+            lambda: self._auto_close_overlays("max watch time")
+        )
+        # Pending auto-close (debounced focus-loss). Fires shortly after
+        # focus leaves our overlay; cancelled if focus comes back.
+        self._fg_pending_close = QTimer(self)
+        self._fg_pending_close.setSingleShot(True)
+        self._fg_pending_close.setInterval(350)
+        self._fg_pending_close.timeout.connect(
+            lambda: self._auto_close_overlays("focus left overlay")
+        )
+
+        # Qt-level signal: fires when our app goes inactive / active.
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                app.applicationStateChanged.connect(self._on_app_state_changed)
+                app.focusWindowChanged.connect(self._on_focus_window_changed)
+        except Exception as exc:
+            print(f"[overlay] could not hook app state: {exc}")
 
         self._setup_window()
         self._build_ui()
@@ -1468,6 +1676,51 @@ class EmotionOverlay(QWidget):
         screen = QApplication.primaryScreen().geometry()
         self.setGeometry(screen)
 
+    # ── Mouse routing ──────────────────────
+    def mousePressEvent(self, event) -> None:
+        """
+        EmotionOverlay is a full-screen always-on-top window that mostly
+        renders nothing — only its children (camera button, explanation
+        card, …) are visible. The OS still routes every click inside the
+        window to *us*, so clicks on a face's bbox (which is painted by
+        the SEPARATE BBoxScreenOverlay below us) would otherwise be
+        silently absorbed and never reach the bbox overlay's own
+        mousePressEvent.
+
+        We fix that here: if the click lands on a face's bbox area, we
+        forward it to the bbox overlay (and to `_on_bbox_clicked`) just
+        as if the user had clicked the bbox directly. Any other click is
+        passed to `super()` so children (buttons, panels, cards) keep
+        receiving events normally.
+        """
+        try:
+            if (
+                event.button() == Qt.LeftButton
+                and hasattr(self, "_bbox_overlay")
+                and self._bbox_overlay is not None
+                and self._bbox_overlay.isVisible()
+            ):
+                # Convert click position from EmotionOverlay-space to
+                # the bbox overlay's coordinate space. Both windows are
+                # positioned at the screen's top-left, but in case of
+                # multi-monitor offsets we map through globalPos().
+                global_pos = event.globalPos()
+                bbox_pos   = self._bbox_overlay.mapFromGlobal(global_pos)
+                idx        = self._bbox_overlay.face_at_position(bbox_pos)
+                print(
+                    f"[overlay] mousePressEvent at "
+                    f"global=({global_pos.x()},{global_pos.y()}) "
+                    f"→ face_at_position={idx}"
+                )
+                if idx is not None:
+                    self._bbox_overlay.set_active_face_idx(idx)
+                    self._on_bbox_clicked(idx)
+                    event.accept()
+                    return
+        except Exception as exc:
+            print(f"[overlay] mousePressEvent forwarding failed: {exc}")
+        super().mousePressEvent(event)
+
     # ── בנייה ─────────────────────────────
 
     def _build_ui(self) -> None:
@@ -1492,6 +1745,11 @@ class EmotionOverlay(QWidget):
 
         # שכבת תיבות זיהוי — חלון עצמאי שקוף מעל הכל
         self._bbox_overlay = BBoxScreenOverlay()
+
+        # Toast for "no faces detected" — separate top-level widget so
+        # it shows above any application without competing with the
+        # bbox overlay's mask.
+        self._no_faces_toast = NoFacesToast()
 
         # Explainable AI — floating draggable explanation card
         from ui.explanation_card import ExplanationCard
@@ -1616,6 +1874,25 @@ class EmotionOverlay(QWidget):
         self._panel.hide()
 
         faces = results.get("faces", [])
+        if not faces:
+            # No faces in the analyzed image — show a small toast and
+            # bail. Don't start any auto-close watchers (there's
+            # nothing to watch).
+            self._show_no_faces_toast()
+            try:
+                if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
+                    self._bbox_overlay.hide_faces()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_explanation") and self._explanation is not None:
+                    self._explanation.hide()
+            except Exception:
+                pass
+            self.show()
+            self.raise_()
+            return
+
         if faces:
             ox, oy = self._last_offset
             screen   = QApplication.primaryScreen()
@@ -1654,8 +1931,31 @@ class EmotionOverlay(QWidget):
         # Start auto-close watching: hide overlays when the user switches
         # away from the captured application (so the analysis doesn't follow
         # the user across unrelated apps like Canva, browsers, etc).
-        if self._captured_hwnd and faces:
+        # We start the timers whenever there ARE faces, even if we couldn't
+        # capture the original foreground hwnd — the max-timer is the hard
+        # safety-net that guarantees the overlays go away.
+        if faces:
             self._fg_watch_timer.start()
+            self._fg_max_timer.start()
+            print(
+                f"[overlay] watcher started "
+                f"(hwnd={self._captured_hwnd}, max={self._fg_max_timer.interval()}ms)"
+            )
+
+            # Pixel-change watcher: handles the case where the underlying
+            # app stays the same (same hwnd / title) but the user navigates
+            # between photos inside it (e.g. Photos app, image slideshow,
+            # social feed). We snapshot the captured region a moment after
+            # the bboxes have rendered, then poll for changes every ~1.5s.
+            ox = self._last_offset[0]
+            oy = self._last_offset[1]
+            cap_w = img.shape[1] if img is not None else 0
+            cap_h = img.shape[0] if img is not None else 0
+            if cap_w > 0 and cap_h > 0:
+                self._pixel_check_region = (int(ox), int(oy), int(cap_w), int(cap_h))
+                self._pixel_reference = None
+                QTimer.singleShot(450, self._take_pixel_reference)
+                self._pixel_check_timer.start()
 
         # Notify listeners (e.g. Explainable AI) — we are in the main thread.
         try:
@@ -1690,49 +1990,335 @@ class EmotionOverlay(QWidget):
     def _on_explanation_closed(self) -> None:
         """Card was dismissed by the user — also clear the bboxes."""
         self._fg_watch_timer.stop()
-        self._captured_hwnd = 0
+        self._fg_max_timer.stop()
+        self._fg_pending_close.stop()
+        self._pixel_check_timer.stop()
+        self._pixel_reference = None
+        self._pixel_check_region = None
+        self._captured_hwnd  = 0
+        self._captured_title = ""
+        self._captured_pid   = 0
         if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
             self._bbox_overlay.hide_faces()
 
     # ── Foreground-window watcher ─────────────────────────
 
-    def _check_foreground(self) -> None:
+    def _own_hwnds(self) -> set:
         """
-        Polled every ~800ms. If the user has switched to an application
-        other than the one we captured (and other than our own overlays),
-        auto-hide everything so we don't litter the screen.
+        Return the OS window-handles that belong to *our* Qt application.
+        Includes EmotionOverlay, BBoxScreenOverlay, ExplanationCard, the
+        ResultsPanel, the AnnotatedImageViewer AND the RegionSelector
+        widget that's only alive during region capture — so the
+        foreground-watcher / external-fg poller never accidentally treats
+        one of our own helper windows as "the user's app".
         """
-        if not self._captured_hwnd:
-            self._fg_watch_timer.stop()
-            return
-
-        current = _get_foreground_hwnd()
-        if not current:
-            return
-
-        # Collect handles for our own top-level windows — clicks/focus
-        # on the card or bboxes shouldn't trigger auto-close.
-        my_hwnds = set()
+        my_hwnds: set = set()
+        try:
+            app = QApplication.instance()
+            if app is not None:
+                for w in app.topLevelWidgets():
+                    try:
+                        hwnd = int(w.winId())
+                        if hwnd:
+                            my_hwnds.add(hwnd)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # Explicit fallback: even if topLevelWidgets() missed something,
+        # always include the three windows we care about most.
+        for attr in ("_bbox_overlay", "_explanation"):
+            try:
+                obj = getattr(self, attr, None)
+                if obj is not None:
+                    my_hwnds.add(int(obj.winId()))
+            except Exception:
+                pass
         try:
             my_hwnds.add(int(self.winId()))
         except Exception:
             pass
+        return my_hwnds
+
+    # ── Pixel-content watcher ─────────────────────────────
+
+    def _grab_thumbnail(self, x: int, y: int, w: int, h: int,
+                        target: int = 32) -> "np.ndarray | None":
+        """
+        Capture a small thumbnail (≈`target`×`target` px) of a screen
+        region for fast change-detection. Returns None on any failure.
+
+        Uses our existing `ScreenCapturer.capture_region` (mss) so it
+        works the same way as the original screenshot and respects the
+        same DPI / monitor configuration.
+        """
+        try:
+            if w <= 4 or h <= 4:
+                return None
+            from capture.screen_capture import ScreenCapturer
+            img = ScreenCapturer().capture_region(int(x), int(y), int(w), int(h))
+            if img is None or img.size == 0:
+                return None
+            # Cheap NumPy subsampling — avoids cv2 import + handles any
+            # input resolution.
+            step_h = max(1, img.shape[0] // target)
+            step_w = max(1, img.shape[1] // target)
+            return img[::step_h, ::step_w]
+        except Exception as exc:
+            print(f"[overlay] thumbnail grab failed: {exc}")
+            return None
+
+    def _take_pixel_reference(self) -> None:
+        """Snapshot the current state of the captured region as ground truth."""
+        if not self._pixel_check_region:
+            return
+        x, y, w, h = self._pixel_check_region
+        self._pixel_reference = self._grab_thumbnail(x, y, w, h)
+        if self._pixel_reference is not None:
+            print(
+                f"[overlay] pixel reference captured "
+                f"shape={self._pixel_reference.shape} for region ({x},{y},{w}x{h})"
+            )
+
+    def _check_pixel_change(self) -> None:
+        """
+        Sample the captured region again and compare with the reference.
+        Closes the overlays if the mean absolute difference exceeds the
+        threshold — the visible content has changed (e.g. user scrolled
+        to a different photo inside the same window).
+        """
+        if self._pixel_reference is None or not self._pixel_check_region:
+            return
+        x, y, w, h = self._pixel_check_region
+        current = self._grab_thumbnail(x, y, w, h)
+        if current is None:
+            return
+        if current.shape != self._pixel_reference.shape:
+            # Region or DPI changed under us — treat as content change.
+            self._auto_close_overlays("pixel reference shape mismatch")
+            return
+        try:
+            diff = float(
+                np.abs(
+                    current.astype(np.int32)
+                    - self._pixel_reference.astype(np.int32)
+                ).mean()
+            )
+        except Exception:
+            return
+        # Threshold tuned for "the underlying photo changed" while
+        # tolerating cursor / minor UI tweaks.
+        if diff > 22.0:
+            print(f"[overlay] pixel change MAE={diff:.1f} → auto-close")
+            self._auto_close_overlays(f"content changed (MAE={diff:.1f})")
+
+    def _capture_external_foreground(self) -> tuple[int, str]:
+        """
+        Return `(hwnd, title)` for the user's "external" foreground app.
+
+        First checks `GetForegroundWindow()` directly; if that returns 0
+        or one of our own overlay windows, falls back to the
+        continuously-polled `_last_external_hwnd`. This is robust to
+        focus shifts that happen when the user clicks our floating
+        button (some OS configurations briefly promote our overlay to
+        the foreground).
+        """
+        captured = _get_foreground_hwnd()
+        own = self._own_hwnds()
+        if (not captured) or (captured in own):
+            captured       = self._last_external_hwnd
+            captured_title = self._last_external_title
+        else:
+            captured_title = _get_window_title(captured)
+        return captured, captured_title
+
+    def _show_no_faces_toast(self) -> None:
+        """Pop the 'no faces detected' banner. Safe to call repeatedly."""
+        try:
+            if hasattr(self, "_no_faces_toast") and self._no_faces_toast is not None:
+                self._no_faces_toast.pop()
+                print("[overlay] toast → no faces detected on screen")
+        except Exception as exc:
+            print(f"[overlay] toast failed: {exc}")
+
+    def keyPressEvent(self, event) -> None:
+        """
+        Esc on the overlay (or on any of its child widgets that don't
+        consume the key first) clears the active analysis. Useful for
+        the demo when the user just wants the bboxes off the screen
+        without clicking the × on the explanation card.
+        """
+        if event.key() == Qt.Key_Escape:
+            self._clear_active_analysis(reason="user pressed Esc")
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _clear_active_analysis(self, reason: str = "") -> None:
+        """
+        Hide the bboxes + the AI explanation card right now, and stop all
+        running auto-close timers. Used at the start of a new capture so
+        the previous analysis disappears immediately (instead of
+        lingering on screen for the 2-5 seconds it takes the new worker
+        to finish) and also exposed to keyboard / click handlers as a
+        "clear it all" shortcut.
+        """
+        if reason:
+            print(f"[overlay] clearing previous analysis ({reason})")
+        try:
+            self._fg_watch_timer.stop()
+            self._fg_max_timer.stop()
+            self._fg_pending_close.stop()
+            self._pixel_check_timer.stop()
+        except Exception:
+            pass
+        self._pixel_reference = None
+        self._pixel_check_region = None
+        self._captured_hwnd  = 0
+        self._captured_title = ""
+        self._captured_pid   = 0
         try:
             if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
-                my_hwnds.add(int(self._bbox_overlay.winId()))
+                self._bbox_overlay.hide_faces()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_explanation") and self._explanation is not None:
+                # Use Qt's hide() — we don't want to emit `closed`
+                # (that would trigger _on_explanation_closed → another
+                # bbox-hide loop).
+                self._explanation.hide()
         except Exception:
             pass
 
-        if current == self._captured_hwnd or current in my_hwnds:
-            return  # still on captured app or interacting with our overlay
+    def _poll_external_foreground(self) -> None:
+        """
+        Polled every ~250ms. Records the OS window-handle of the user's
+        current foreground app whenever it ISN'T one of our own windows.
+        `_on_capture` / `_on_region` later read this if the foreground at
+        click-time happens to be our overlay (which can happen on some
+        OS configurations when the floating button momentarily grabs
+        focus).
+        """
+        if _USER32 is None:
+            return
+        try:
+            fg = _get_foreground_hwnd()
+            if not fg:
+                return
+            if fg in self._own_hwnds():
+                return
+            if fg == self._last_external_hwnd:
+                # Keep title fresh in case the user just switched tabs.
+                self._last_external_title = _get_window_title(fg)
+                return
+            self._last_external_hwnd  = fg
+            self._last_external_title = _get_window_title(fg)
+        except Exception:
+            pass
 
-        self._auto_close_overlays("foreground window changed")
+    def _check_foreground(self) -> None:
+        """
+        Polled every ~400ms. If the user has switched to an application
+        other than the one we captured (and other than our own overlays),
+        auto-hide everything so we don't litter the screen.
+
+        Also handles the *browser tab switch* case: the OS hwnd of a
+        browser window is identical across tabs, so we additionally
+        compare the window title — any non-trivial title change is
+        treated as a context switch and the overlays are hidden.
+        """
+        current = _get_foreground_hwnd()
+        if not current:
+            return
+
+        my_hwnds = self._own_hwnds()
+
+        # Focus is on our own overlay (card / bboxes / camera button) —
+        # never auto-close in that case.
+        if current in my_hwnds:
+            return
+
+        # If we don't have a captured hwnd to compare against (typical
+        # for region-select capture, or when Qt promoted our overlay to
+        # the foreground at click time), we can't tell whether the user
+        # is "still on the captured app" or not. Instead of closing
+        # aggressively, fall back to the max-timer + Qt focus signals.
+        if not self._captured_hwnd:
+            return
+
+        # Foreground switched to a completely different window → close.
+        if current != self._captured_hwnd:
+            self._auto_close_overlays(
+                f"foreground window changed "
+                f"(captured={self._captured_hwnd}, current={current})"
+            )
+            return
+
+        # Same hwnd as captured — but maybe the user switched *tabs*
+        # inside a browser (same window, different document). In that
+        # case the window title changes; treat that as a context switch.
+        current_title = _get_window_title(current)
+        if (
+            self._captured_title
+            and current_title
+            and current_title != self._captured_title
+        ):
+            self._auto_close_overlays(
+                f"window title changed ({self._captured_title!r} → {current_title!r})"
+            )
+
+    def _on_app_state_changed(self, state) -> None:
+        """
+        Qt signal: our application became (in)active. Used as an
+        additional trigger so the bboxes vanish the moment focus leaves
+        all of our windows, even if the OS-foreground check is slow.
+        """
+        if not self._fg_watch_timer.isActive() and not self._fg_max_timer.isActive():
+            return
+        try:
+            inactive = state != Qt.ApplicationActive
+        except Exception:
+            inactive = False
+        if inactive:
+            print("[overlay] app state went inactive → scheduling close")
+            self._fg_pending_close.start()
+        else:
+            self._fg_pending_close.stop()
+
+    def _on_focus_window_changed(self, window) -> None:
+        """
+        Qt signal: focusWindow changed. If the new focus window is None
+        (focus left our process) and we're showing overlays, close them
+        after a short debounce.
+        """
+        if not self._fg_watch_timer.isActive() and not self._fg_max_timer.isActive():
+            return
+        if window is None:
+            self._fg_pending_close.start()
+        else:
+            self._fg_pending_close.stop()
 
     def _auto_close_overlays(self, reason: str) -> None:
         """Hide all analysis overlays. Called by the foreground watcher."""
+        # Avoid double-close spam if multiple signals fire at once.
+        if (
+            not self._fg_watch_timer.isActive()
+            and not self._fg_max_timer.isActive()
+            and not self._pixel_check_timer.isActive()
+            and not self._captured_hwnd
+        ):
+            return
         print(f"[overlay] auto-close ({reason})")
         self._fg_watch_timer.stop()
-        self._captured_hwnd = 0
+        self._fg_max_timer.stop()
+        self._fg_pending_close.stop()
+        self._pixel_check_timer.stop()
+        self._pixel_reference = None
+        self._pixel_check_region = None
+        self._captured_hwnd  = 0
+        self._captured_title = ""
+        self._captured_pid   = 0
         if hasattr(self, "_bbox_overlay") and self._bbox_overlay is not None:
             self._bbox_overlay.hide_faces()
         if hasattr(self, "_explanation") and self._explanation is not None:
@@ -1741,6 +2327,7 @@ class EmotionOverlay(QWidget):
     def _on_bbox_clicked(self, idx: int) -> None:
         """User clicked a face's bbox on the screen."""
         target_id = f"face:{idx}"
+        print(f"[overlay] bbox clicked → {target_id}")
         if hasattr(self, "_explanation") and self._explanation is not None:
             self._explanation.set_active_tab(target_id)
         # bbox already highlighted itself in its own mousePressEvent
@@ -1815,11 +2402,27 @@ class EmotionOverlay(QWidget):
         if self._worker and self._worker.isRunning():
             return
 
+        # Clear any leftover bboxes / explanation from the PREVIOUS
+        # analysis BEFORE we start a new capture — otherwise the user
+        # sees stale rectangles drifting on the screen for several
+        # seconds while the new worker is still running.
+        self._clear_active_analysis(reason="new capture starting")
+
         # Snapshot the OS-level handle of whatever the user is looking at
         # RIGHT NOW. Recorded before we hide anything; used by the
-        # foreground watcher to auto-close when she switches apps.
+        # foreground watcher to auto-close when she switches apps OR even
+        # switches browser tabs (same hwnd, different title).
         self._fg_watch_timer.stop()
-        self._captured_hwnd = _get_foreground_hwnd()
+        self._fg_max_timer.stop()
+        self._fg_pending_close.stop()
+        captured, captured_title = self._capture_external_foreground()
+        self._captured_hwnd  = captured
+        self._captured_title = captured_title
+        self._captured_pid   = _get_window_process_id(captured) if captured else 0
+        print(
+            f"[overlay] full capture — captured hwnd={self._captured_hwnd} "
+            f"pid={self._captured_pid} title={self._captured_title!r}"
+        )
 
         self._panel.hide()
         # מסתירים רק את הכפתור (לא את כל ה-overlay) כדי שלא יופיע בצילום
@@ -1860,6 +2463,25 @@ class EmotionOverlay(QWidget):
         """
         if self._worker and self._worker.isRunning():
             return
+
+        # Clear any previous analysis from the screen first.
+        self._clear_active_analysis(reason="new region capture starting")
+
+        # Snapshot foreground (with robust fallback to the last *external*
+        # window we polled) — same logic as `_on_capture`. Without this
+        # the foreground-watcher saw `_captured_hwnd == 0` and triggered
+        # auto-close ~400ms after the bboxes appeared.
+        self._fg_watch_timer.stop()
+        self._fg_max_timer.stop()
+        self._fg_pending_close.stop()
+        captured, captured_title = self._capture_external_foreground()
+        self._captured_hwnd  = captured
+        self._captured_title = captured_title
+        self._captured_pid   = _get_window_process_id(captured) if captured else 0
+        print(
+            f"[overlay] region capture — captured hwnd={self._captured_hwnd} "
+            f"pid={self._captured_pid} title={self._captured_title!r}"
+        )
 
         self._btn.set_processing(True)
         self._panel.hide()

@@ -966,6 +966,13 @@ class ExplanationCard(QFrame):
     # ──────────────────────────────────────────
 
     def prepare(self, results: dict) -> None:
+        """
+        Initialise the card's internal state for a new analysis result
+        WITHOUT showing the card. The popup is intentionally kept hidden
+        until the user actively clicks a face on the screen — at that
+        point `set_active_tab()` + `show_loading()` will pop it up with
+        the AI explanation for the selected face.
+        """
         self._faces = results.get("faces") or []
         self._final_emotion = results.get("final_emotion") or "unknown"
         try:
@@ -980,13 +987,20 @@ class ExplanationCard(QFrame):
         self._set_active_nav("overview")
         if hasattr(self, "_scroll_area"):
             self._scroll_area.verticalScrollBar().setValue(0)
-        self._show_and_reposition()
+        # Keep card hidden — opens on first bbox click (via show_loading).
+        self.hide()
 
     def set_active_tab(self, target_id: str) -> None:
         if target_id not in self._tab_meta:
+            print(
+                f"[card] set_active_tab({target_id!r}) ignored — "
+                f"not in tab_meta {list(self._tab_meta.keys())}"
+            )
             return
         if target_id == self._active_tab:
+            print(f"[card] set_active_tab({target_id!r}) — already active")
             return
+        print(f"[card] set_active_tab: {self._active_tab!r} → {target_id!r}")
         self._active_tab = target_id
         self._apply_active()
 

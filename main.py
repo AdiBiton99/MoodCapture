@@ -9,10 +9,10 @@ main.py — נקודת הכניסה הראשית של מערכת MoodCapture
          → EmotionOverlay (UI)
 
 הרצה:
-    python main.py                                    # UI, DeepFace (default)
+    python main.py                                    # UI, Ensemble w=0.5 (default)
     python main.py --once                             # ניתוח חד-פעמי בטרמינל
+    python main.py --model deepface                   # רק DeepFace
     python main.py --model finetuned                  # רק המודל המכוונן
-    python main.py --model ensemble                   # שילוב DeepFace + מכוונן
     python main.py --model ensemble --ensemble-weight 0.6
 """
 
@@ -206,12 +206,20 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
 
     def _on_worker_done(seq: int, target_id: str, text: str) -> None:
         if seq != _explain_state["seq"]:
+            print(f"[ExplainAI] worker done ({target_id}) — seq stale, drop")
             return  # superseded by a newer capture
         if not text:
+            print(f"[ExplainAI] worker done ({target_id}) — empty text, skip")
             return
         _explain_state["cache"][target_id] = text
+        active = overlay.get_active_explanation_tab()
+        print(
+            f"[ExplainAI] worker done → {target_id}  (active={active})  "
+            f"will_update={active == target_id}  "
+            f"text[:60]={text[:60]!r}"
+        )
         # Only refresh the body if the user is still viewing this tab.
-        if overlay.get_active_explanation_tab() == target_id:
+        if active == target_id:
             overlay.update_explanation(text)
 
     def _on_worker_failed(seq: int, target_id: str, err: str) -> None:
@@ -248,13 +256,16 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
     def _request_target(target_id: str) -> None:
         """Spawn a worker for `target_id` (no-op if already cached)."""
         if target_id in _explain_state["cache"]:
+            print(f"[ExplainAI] _request_target({target_id}) — cache HIT")
             if overlay.get_active_explanation_tab() == target_id:
                 overlay.update_explanation(_explain_state["cache"][target_id])
             return
         seq = _explain_state["seq"]
         results = _explain_state["results"]
         if results is None:
+            print(f"[ExplainAI] _request_target({target_id}) — no results, abort")
             return
+        print(f"[ExplainAI] _request_target({target_id}) — spawning worker (seq={seq})")
         worker = _ExplainWorker(seq, target_id, results)
         worker.finished_text.connect(_on_worker_done)
         worker.failed.connect(_on_worker_failed)
@@ -283,8 +294,11 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
         chip + tab highlight on the UI side; we just need to refresh the body.
         """
         if _explain_state["results"] is None:
+            print(f"[ExplainAI] face requested ({target_id}) ignored — no results yet")
             return
-        if target_id in _explain_state["cache"]:
+        cached = target_id in _explain_state["cache"]
+        print(f"[ExplainAI] face requested → {target_id} (cached={cached})")
+        if cached:
             overlay.update_explanation(_explain_state["cache"][target_id])
         else:
             overlay.show_explanation_loading()
@@ -375,10 +389,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python main.py                                # UI, DeepFace (default)\n"
+            "  python main.py                                # UI, Ensemble w=0.5 (default)\n"
             "  python main.py --once                         # one-shot analysis\n"
+            "  python main.py --model deepface               # DeepFace only\n"
             "  python main.py --model finetuned              # fine-tuned model only\n"
-            "  python main.py --model ensemble               # DeepFace + fine-tuned\n"
             "  python main.py --model ensemble --ensemble-weight 0.6\n"
         ),
     )
@@ -390,8 +404,11 @@ def main() -> None:
     parser.add_argument(
         "--model",
         choices=("deepface", "finetuned", "ensemble"),
-        default="deepface",
-        help="Which emotion model to use. Default: deepface.",
+        default="ensemble",
+        help=(
+            "Which emotion model to use. Default: ensemble "
+            "(DeepFace + Fine-tuned MobileNetV2, weighted average)."
+        ),
     )
     parser.add_argument(
         "--ensemble-weight",
