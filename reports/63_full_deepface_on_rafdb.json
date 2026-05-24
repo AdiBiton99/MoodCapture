@@ -1,0 +1,143 @@
+{
+  "n_samples": 3068,
+  "labels": [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise"
+  ],
+  "accuracy": 0.5134,
+  "per_class": {
+    "angry": {
+      "precision": 0.2174,
+      "recall": 0.4938,
+      "f1": 0.3019,
+      "support": 162
+    },
+    "disgust": {
+      "precision": 0.2727,
+      "recall": 0.0187,
+      "f1": 0.0351,
+      "support": 160
+    },
+    "fear": {
+      "precision": 0.0737,
+      "recall": 0.2162,
+      "f1": 0.11,
+      "support": 74
+    },
+    "happy": {
+      "precision": 0.7361,
+      "recall": 0.7485,
+      "f1": 0.7423,
+      "support": 1185
+    },
+    "neutral": {
+      "precision": 0.5191,
+      "recall": 0.5206,
+      "f1": 0.5198,
+      "support": 680
+    },
+    "sad": {
+      "precision": 0.3327,
+      "recall": 0.3431,
+      "f1": 0.3378,
+      "support": 478
+    },
+    "surprise": {
+      "precision": 0.7717,
+      "recall": 0.2158,
+      "f1": 0.3373,
+      "support": 329
+    }
+  },
+  "averages": {
+    "macro": {
+      "precision": 0.4176,
+      "recall": 0.3653,
+      "f1": 0.3406
+    },
+    "weighted": {
+      "precision": 0.5614,
+      "recall": 0.5134,
+      "f1": 0.5111
+    }
+  },
+  "confusion_matrix": [
+    [
+      80,
+      1,
+      7,
+      38,
+      16,
+      17,
+      3
+    ],
+    [
+      41,
+      3,
+      20,
+      21,
+      38,
+      37,
+      0
+    ],
+    [
+      9,
+      0,
+      16,
+      26,
+      8,
+      11,
+      4
+    ],
+    [
+      48,
+      2,
+      36,
+      887,
+      104,
+      102,
+      6
+    ],
+    [
+      78,
+      0,
+      51,
+      74,
+      354,
+      120,
+      3
+    ],
+    [
+      63,
+      5,
+      42,
+      111,
+      88,
+      164,
+      5
+    ],
+    [
+      49,
+      0,
+      45,
+      48,
+      74,
+      42,
+      71
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n       angry       0.22      0.49      0.30       162\n     disgust       0.27      0.02      0.04       160\n        fear       0.07      0.22      0.11        74\n       happy       0.74      0.75      0.74      1185\n     neutral       0.52      0.52      0.52       680\n         sad       0.33      0.34      0.34       478\n    surprise       0.77      0.22      0.34       329\n\n    accuracy                           0.51      3068\n   macro avg       0.42      0.37      0.34      3068\nweighted avg       0.56      0.51      0.51      3068\n",
+  "dataset_dir": "data/rafdb",
+  "split": "test",
+  "source": "crops",
+  "mode": "deepface",
+  "ensemble_weight": null,
+  "finetuned_path": null,
+  "skipped_samples": 0,
+  "requested_samples": 3068
+}

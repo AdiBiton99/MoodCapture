@@ -1617,7 +1617,7 @@ class EmotionOverlay(QWidget):
         self._pixel_reference: "np.ndarray | None" = None
         self._pixel_check_region: "tuple[int, int, int, int] | None" = None
         self._pixel_check_timer = QTimer(self)
-        self._pixel_check_timer.setInterval(1500)
+        self._pixel_check_timer.setInterval(800)
         self._pixel_check_timer.timeout.connect(self._check_pixel_change)
 
         self._fg_watch_timer = QTimer(self)
@@ -1679,42 +1679,56 @@ class EmotionOverlay(QWidget):
     # ── Mouse routing ──────────────────────
     def mousePressEvent(self, event) -> None:
         """
-        EmotionOverlay is a full-screen always-on-top window that mostly
-        renders nothing — only its children (camera button, explanation
-        card, …) are visible. The OS still routes every click inside the
-        window to *us*, so clicks on a face's bbox (which is painted by
-        the SEPARATE BBoxScreenOverlay below us) would otherwise be
-        silently absorbed and never reach the bbox overlay's own
-        mousePressEvent.
+        EmotionOverlay is a full-screen always-on-top window. Three kinds
+        of clicks can happen on it:
 
-        We fix that here: if the click lands on a face's bbox area, we
-        forward it to the bbox overlay (and to `_on_bbox_clicked`) just
-        as if the user had clicked the bbox directly. Any other click is
-        passed to `super()` so children (buttons, panels, cards) keep
-        receiving events normally.
+        1. Click on a face's bbox  → open the explanation card for that
+           face.
+        2. Click on a child widget (camera button, results panel,
+           explanation card, …) → let Qt deliver the event normally so
+           the widget handles it.
+        3. Click on a transparent area (none of the above) → the user
+           clearly wants to interact with the app *underneath* our
+           overlay. We dismiss the analysis so she can do that, and the
+           next click will land on the actual underlying app.
         """
         try:
-            if (
-                event.button() == Qt.LeftButton
-                and hasattr(self, "_bbox_overlay")
-                and self._bbox_overlay is not None
-                and self._bbox_overlay.isVisible()
-            ):
-                # Convert click position from EmotionOverlay-space to
-                # the bbox overlay's coordinate space. Both windows are
-                # positioned at the screen's top-left, but in case of
-                # multi-monitor offsets we map through globalPos().
-                global_pos = event.globalPos()
-                bbox_pos   = self._bbox_overlay.mapFromGlobal(global_pos)
-                idx        = self._bbox_overlay.face_at_position(bbox_pos)
-                print(
-                    f"[overlay] mousePressEvent at "
-                    f"global=({global_pos.x()},{global_pos.y()}) "
-                    f"→ face_at_position={idx}"
+            if event.button() == Qt.LeftButton:
+                # ─ 1. bbox check ─
+                if (
+                    hasattr(self, "_bbox_overlay")
+                    and self._bbox_overlay is not None
+                    and self._bbox_overlay.isVisible()
+                ):
+                    global_pos = event.globalPos()
+                    bbox_pos = self._bbox_overlay.mapFromGlobal(global_pos)
+                    idx = self._bbox_overlay.face_at_position(bbox_pos)
+                    if idx is not None:
+                        print(
+                            f"[overlay] mousePressEvent at "
+                            f"global=({global_pos.x()},{global_pos.y()}) "
+                            f"→ face_at_position={idx}"
+                        )
+                        self._bbox_overlay.set_active_face_idx(idx)
+                        self._on_bbox_clicked(idx)
+                        event.accept()
+                        return
+
+                # ─ 3. dismiss-on-empty-click ─
+                # Only do this when an analysis is *active*, otherwise we'd
+                # interfere with regular interactions.
+                analysis_active = (
+                    (hasattr(self, "_bbox_overlay")
+                     and self._bbox_overlay is not None
+                     and self._bbox_overlay.isVisible())
+                    or (hasattr(self, "_explanation")
+                        and self._explanation is not None
+                        and self._explanation.isVisible())
                 )
-                if idx is not None:
-                    self._bbox_overlay.set_active_face_idx(idx)
-                    self._on_bbox_clicked(idx)
+                child = self.childAt(event.pos())
+                if analysis_active and child is None:
+                    print("[overlay] click on transparent area → dismissing analysis")
+                    self._clear_active_analysis(reason="user clicked outside")
                     event.accept()
                     return
         except Exception as exc:
@@ -2106,9 +2120,12 @@ class EmotionOverlay(QWidget):
             )
         except Exception:
             return
-        # Threshold tuned for "the underlying photo changed" while
-        # tolerating cursor / minor UI tweaks.
-        if diff > 22.0:
+        # Threshold tuned for "the underlying content changed" while
+        # tolerating cursor / minor UI tweaks. Lower = more sensitive.
+        # 12 is sensitive enough to catch slide switches in PowerPoint /
+        # Canva (where part of the screen — e.g. the thumbnail bar —
+        # changes) without firing on small mouse movements.
+        if diff > 12.0:
             print(f"[overlay] pixel change MAE={diff:.1f} → auto-close")
             self._auto_close_overlays(f"content changed (MAE={diff:.1f})")
 
@@ -2300,7 +2317,16 @@ class EmotionOverlay(QWidget):
             self._fg_pending_close.stop()
 
     def _auto_close_overlays(self, reason: str) -> None:
-        """Hide all analysis overlays. Called by the foreground watcher."""
+        """
+        Hide screen-anchored analysis overlays (the bbox highlights that
+        sit on top of the captured screen). Called by the foreground +
+        pixel watchers when the underlying screen changes.
+
+        The floating Explanation card is intentionally kept visible —
+        once the AI has explained a face the user usually wants to keep
+        reading the explanation while switching to other windows. The
+        card has its own × button for manual dismissal.
+        """
         # Avoid double-close spam if multiple signals fire at once.
         if (
             not self._fg_watch_timer.isActive()
@@ -2332,6 +2358,16 @@ class EmotionOverlay(QWidget):
             self._explanation.set_active_tab(target_id)
         # bbox already highlighted itself in its own mousePressEvent
         self.face_explanation_requested.emit(target_id)
+
+        # The card is about to appear on top of the captured screen.
+        # Without re-baselining, the pixel watcher would diff "screen
+        # without card" vs "screen with card", trip its threshold, and
+        # auto-close the bboxes — causing the card to flicker (open,
+        # vanish for a tick, then re-open when the AI worker returns).
+        # Re-take the reference shortly after the card is laid out so
+        # the card itself becomes part of the new baseline.
+        QTimer.singleShot(120, self._take_pixel_reference)
+        QTimer.singleShot(450, self._take_pixel_reference)
 
     def _on_card_tab_selected(self, target_id: str) -> None:
         """User clicked a visible tab inside the card (e.g. 'Overall')."""

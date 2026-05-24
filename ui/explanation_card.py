@@ -69,14 +69,80 @@ EMOTION_COLORS = {
     "disgust":  "#B5689A",
 }
 
+# Each entry is a list of (label, tooltip-explanation) pairs.
+# Labels are short and friendly; tooltips give a simple explanation
+# that anyone (including kids) can understand.
 DETECTED_SIGNALS = {
-    "happy":    ["Smile intensity", "Eye openness", "Mouth curvature", "Face symmetry"],
-    "sad":      ["Mouth downturn", "Eye droop", "Brow tension", "Reduced energy"],
-    "angry":    ["Brow furrow", "Mouth tightness", "Eye narrowing", "Jaw tension"],
-    "neutral":  ["Relaxed features", "Symmetric face", "Steady gaze", "Soft mouth"],
-    "surprise": ["Wide eyes", "Raised brows", "Open mouth", "Forehead lines"],
-    "fear":     ["Wide eyes", "Brow elevation", "Mouth tension", "Eye strain"],
-    "disgust":  ["Nose wrinkle", "Upper-lip raise", "Brow lowering", "Mouth asymmetry"],
+    "happy": [
+        ("Corners of mouth up",
+         "When we're happy, the corners of our mouth automatically pull upward into a smile — we can't help it!"),
+        ("Cheeks lifted",
+         "Happy cheeks rise up and make our eyes look smaller — that's the sign of a real smile!"),
+        ("Lips slightly open",
+         "A big happy smile often opens the mouth a little and shows the teeth."),
+        ("Bright, relaxed eyes",
+         "Happy eyes are wide open and relaxed — no tension, just joy."),
+    ],
+    "sad": [
+        ("Eyebrows pulled together",
+         "When we're sad, the inner corners of our eyebrows pull upward and toward each other, making a worried shape."),
+        ("Corners of mouth down",
+         "Sadness pulls the corners of the mouth downward into a frown."),
+        ("Lower lip pushed up",
+         "The chin wrinkles and the lower lip pushes up — like we're about to cry."),
+        ("Heavy, drooping eyes",
+         "Sad eyes look heavy and tired, as if they might close at any moment."),
+    ],
+    "angry": [
+        ("Eyebrows pulled down",
+         "Anger pulls the eyebrows down and together, creating a deep furrow between them."),
+        ("Eyes wide and staring",
+         "Angry eyes open wide and stare hard — like a glare that says 'stop it!'"),
+        ("Tight, pressed lips",
+         "Angry lips press together tightly into a thin, tense line."),
+        ("Tense jaw",
+         "The jaw clenches and the muscles on the sides of the face tighten."),
+    ],
+    "neutral": [
+        ("Relaxed face",
+         "No muscles are working hard — the whole face is calm and at rest."),
+        ("Even, balanced features",
+         "Both sides of the face look the same — a sign that no strong emotion is active."),
+        ("Normal eyes",
+         "Eyes are open at a comfortable width — not wide with surprise, not narrow with anger."),
+        ("Straight mouth",
+         "The mouth is in a flat, straight line — not smiling or frowning."),
+    ],
+    "surprise": [
+        ("Eyebrows high up",
+         "Surprise shoots the eyebrows all the way up toward the forehead — really high!"),
+        ("Eyes very wide open",
+         "Surprised eyes open as wide as possible so we can see more of what surprised us."),
+        ("Mouth falls open",
+         "The jaw drops and the mouth opens — like when you see something totally unexpected!"),
+        ("Forehead wrinkles",
+         "Raising the eyebrows so fast creates horizontal lines across the forehead."),
+    ],
+    "fear": [
+        ("Eyebrows up AND together",
+         "Fear raises the eyebrows but also squishes them together — making a tense, worried look."),
+        ("Eyes wide open",
+         "Fearful eyes open as wide as possible to see if there is danger nearby."),
+        ("Mouth stretched sideways",
+         "Fear pulls the corners of the mouth sideways (not up) — making a tense, wide-open mouth."),
+        ("Upper eyelids raised",
+         "The upper eyelids lift high, showing the whites of the eyes above the iris."),
+    ],
+    "disgust": [
+        ("Nose wrinkled",
+         "Disgust scrunches up the nose — the same face we make when we smell something horrible!"),
+        ("Upper lip curled up",
+         "The upper lip lifts and curls away from what is disgusting."),
+        ("Eyes slightly narrowed",
+         "Disgusted eyes squint a little, as if trying not to look at something unpleasant."),
+        ("Mouth corners pulled down",
+         "The corners of the mouth turn downward, adding to the overall 'yuck' expression."),
+    ],
 }
 
 ALL_EMOTIONS = ["happy", "neutral", "sad", "angry", "fear", "surprise", "disgust"]
@@ -400,24 +466,134 @@ class _FaceMiniCard(QFrame):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# _CornerResizeGrip — small handle in the footer that resizes the card
+# ══════════════════════════════════════════════════════════════════════
+
+class _CornerResizeGrip(QLabel):
+    """
+    Visible grip that resizes a target widget when dragged.
+
+    The card itself is a QFrame nested inside a full-screen overlay.
+    Its bottom-right corner is occupied by the footer (a child QFrame),
+    so plain mouse-event-based resize logic on the card never fires —
+    children intercept events first. By giving the grip its own widget
+    that captures mouse events directly, we avoid that problem.
+    """
+
+    GRIP_SIZE = 26
+
+    def __init__(self, target: QWidget, parent: QWidget = None) -> None:
+        super().__init__(parent)
+        self._target = target
+        self._dragging = False
+        self._start_global = QPoint()
+        self._start_size = None
+        self.setFixedSize(self.GRIP_SIZE, self.GRIP_SIZE)
+        self.setCursor(Qt.SizeFDiagCursor)
+        self.setToolTip("Drag to resize")
+        self.setText("⤡")
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            f"QLabel {{"
+            f"  font-size: 15px;"
+            f"  font-weight: 800;"
+            f"  color: {C_DIM};"
+            f"  background: {_hex_alpha(C_BORDER_SOFT, 60)};"
+            f"  border: 1px solid {_hex_alpha(C_BORDER, 80)};"
+            f"  border-radius: 6px;"
+            f"}}"
+            f"QLabel:hover {{"
+            f"  color: {C_ACCENT};"
+            f"  background: {_hex_alpha(C_PRIMARY, 18)};"
+            f"  border: 1px solid {_hex_alpha(C_PRIMARY, 60)};"
+            f"}}"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging      = True
+            self._start_global  = event.globalPos()
+            self._start_size    = self._target.size()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and (event.buttons() & Qt.LeftButton):
+            delta = event.globalPos() - self._start_global
+            tgt   = self._target
+            new_w = max(
+                tgt.minimumWidth(),
+                min(tgt.maximumWidth(),
+                    self._start_size.width()  + delta.x()),
+            )
+            new_h = max(
+                tgt.minimumHeight(),
+                min(tgt.maximumHeight(),
+                    self._start_size.height() + delta.y()),
+            )
+            # Stay inside the parent overlay if there is one.
+            parent = tgt.parentWidget()
+            if parent is not None:
+                pr = parent.rect()
+                new_w = min(new_w, max(tgt.minimumWidth(),  pr.width()  - tgt.x()))
+                new_h = min(new_h, max(tgt.minimumHeight(), pr.height() - tgt.y()))
+            tgt.resize(new_w, new_h)
+            # Mark the card as user-resized so subsequent show() calls
+            # don't snap back to the default size.
+            try:
+                tgt._user_resized = True
+            except Exception:
+                pass
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._dragging = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+# ══════════════════════════════════════════════════════════════════════
 # _SignalChip — pill-style detected signal
 # ══════════════════════════════════════════════════════════════════════
 
 class _SignalChip(QLabel):
-    def __init__(self, text: str, parent=None):
+    """A FACS-style signal pill. Hover to read the educational tooltip."""
+
+    def __init__(self, text: str, tooltip: str = "", parent=None):
         super().__init__(f"✓   {text}", parent)
-        self.setFixedHeight(30)
+        self.setWordWrap(True)
         self.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Minimum)
+        if tooltip:
+            self.setToolTip(tooltip)
+        self.setCursor(Qt.WhatsThisCursor)
         self.setStyleSheet(
             f"QLabel {{"
             f"  background: {_hex_alpha(C_GREEN, 14)};"
             f"  color: {C_GREEN_DARK};"
             f"  border: 1px solid {_hex_alpha(C_GREEN, 50)};"
-            f"  border-radius: 15px;"
-            f"  padding: 0 16px 1px 14px;"
-            f"  font-size: 12px;"
+            f"  border-radius: 12px;"
+            f"  padding: 6px 14px;"
+            f"  font-size: 11px;"
             f"  font-weight: 700;"
             f"  letter-spacing: 0.2px;"
+            f"}}"
+            f"QLabel:hover {{"
+            f"  background: {_hex_alpha(C_GREEN, 24)};"
+            f"  border: 1px solid {_hex_alpha(C_GREEN_DARK, 80)};"
+            f"}}"
+            f"QToolTip {{"
+            f"  background: {C_PANEL};"
+            f"  color: {C_TEXT};"
+            f"  border: 1px solid {C_BORDER};"
+            f"  border-radius: 6px;"
+            f"  padding: 8px 10px;"
+            f"  font-size: 11px;"
             f"}}"
         )
 
@@ -429,9 +605,12 @@ class _SignalChip(QLabel):
 class ExplanationCard(QFrame):
     """Premium floating popup for the Explainable AI Emotion Assistant."""
 
-    CARD_WIDTH        = 560
-    CARD_MIN_HEIGHT   = 440
-    MAX_CARD_HEIGHT_RATIO = 0.80
+    CARD_WIDTH        = 560        # default / starting width
+    CARD_MIN_WIDTH    = 200        # user can shrink down to this
+    CARD_MAX_WIDTH    = 980        # and grow up to this
+    CARD_MIN_HEIGHT   = 140
+    MAX_CARD_HEIGHT_RATIO = 0.92   # vs primary screen height
+    RESIZE_HANDLE_PX  = 18         # bottom-right resize hot-zone
     LOADER_INTERVAL   = 320
 
     closed         = pyqtSignal()
@@ -443,6 +622,13 @@ class ExplanationCard(QFrame):
         # ── Drag state ──
         self._drag_offset = QPoint()
         self._is_dragging = False
+
+        # ── Resize state (user resizes via bottom-right handle) ──
+        self._is_resizing       = False
+        self._resize_start_pos  = QPoint()
+        self._resize_start_size = None
+        self._user_resized      = False  # don't auto-resize after first manual resize
+        self.setMouseTracking(True)
 
         # ── Analysis state ──
         self._faces:         list  = []
@@ -469,10 +655,17 @@ class ExplanationCard(QFrame):
         self._build()
         self._apply_style()
 
-        self.setFixedWidth(self.CARD_WIDTH)
-        self.setMinimumHeight(self.CARD_MIN_HEIGHT)
+        # Resizable: clamp width / height between sane bounds rather
+        # than fixing the width. The user can drag the bottom-right
+        # corner to resize.
         screen_h = QApplication.primaryScreen().geometry().height()
-        self.setMaximumHeight(int(screen_h * self.MAX_CARD_HEIGHT_RATIO))
+        screen_w = QApplication.primaryScreen().geometry().width()
+        self.setMinimumSize(self.CARD_MIN_WIDTH, self.CARD_MIN_HEIGHT)
+        self.setMaximumSize(
+            min(self.CARD_MAX_WIDTH, screen_w - 40),
+            int(screen_h * self.MAX_CARD_HEIGHT_RATIO),
+        )
+        self.resize(self.CARD_WIDTH, max(self.CARD_MIN_HEIGHT, 460))
         self.hide()
 
     # ──────────────────────────────────────────
@@ -605,9 +798,16 @@ class ExplanationCard(QFrame):
             f"background: transparent;"
         )
 
+        # Active resize handle. The grip widget owns its own mouse-event
+        # handling so clicks on it always trigger a resize (no risk of
+        # the parent card or any other widget intercepting them first).
+        self._resize_grip = _CornerResizeGrip(self, parent=footer)
+
         h.addWidget(brand)
         h.addStretch()
         h.addWidget(hint)
+        h.addSpacing(6)
+        h.addWidget(self._resize_grip)
         return footer
 
     # ──────────────────────────────────────────
@@ -740,12 +940,13 @@ class ExplanationCard(QFrame):
         return lbl
 
     # ── Section: Overview (hero card) ──
+    # Vertical layout: ring centred, info below — adapts to any width.
 
     def _build_sec_overview(self) -> QFrame:
         section = QFrame()
         sv = QVBoxLayout(section)
         sv.setContentsMargins(0, 0, 0, 0)
-        sv.setSpacing(14)
+        sv.setSpacing(10)
         sv.addWidget(self._make_section_title("OVERVIEW"))
 
         hero = QFrame()
@@ -758,39 +959,45 @@ class ExplanationCard(QFrame):
             f"  border-radius: 16px;"
             f"}}"
         )
-        hh = QHBoxLayout(hero)
-        hh.setContentsMargins(20, 18, 20, 18)
-        hh.setSpacing(20)
+        vv = QVBoxLayout(hero)
+        vv.setContentsMargins(16, 16, 16, 16)
+        vv.setSpacing(8)
+        vv.setAlignment(Qt.AlignHCenter)
 
         self._ring = _EmotionRing()
-        hh.addWidget(self._ring, 0, Qt.AlignVCenter)
-
-        info = QVBoxLayout()
-        info.setSpacing(4)
-        info.setAlignment(Qt.AlignVCenter)
+        vv.addWidget(self._ring, 0, Qt.AlignHCenter)
 
         eyebrow = QLabel("DETECTED EMOTION")
+        eyebrow.setAlignment(Qt.AlignCenter)
         eyebrow.setStyleSheet(
             f"font-size: 9px; font-weight: 800;"
             f"color: {C_DIM}; letter-spacing: 1.8px;"
             f"background: transparent;"
         )
+        vv.addWidget(eyebrow)
 
         self._hero_emotion = QLabel("—")
+        self._hero_emotion.setAlignment(Qt.AlignCenter)
+        self._hero_emotion.setWordWrap(True)
         self._hero_emotion.setStyleSheet(
-            f"font-size: 30px; font-weight: 800;"
+            f"font-size: 26px; font-weight: 800;"
             f"color: {C_TEXT}; letter-spacing: -0.5px;"
             f"background: transparent;"
         )
+        vv.addWidget(self._hero_emotion)
 
         self._hero_conf = QLabel("—  Confidence")
+        self._hero_conf.setAlignment(Qt.AlignCenter)
+        self._hero_conf.setWordWrap(True)
         self._hero_conf.setStyleSheet(
-            f"font-size: 15px; font-weight: 700;"
+            f"font-size: 13px; font-weight: 700;"
             f"color: {C_TEXT_SOFT}; background: transparent;"
         )
+        vv.addWidget(self._hero_conf)
 
         self._hero_face = QLabel("")
         self._hero_face.setFixedHeight(22)
+        self._hero_face.setAlignment(Qt.AlignCenter)
         self._hero_face.setStyleSheet(
             f"QLabel {{"
             f"  background: {_hex_alpha(C_PRIMARY, 12)};"
@@ -804,31 +1011,19 @@ class ExplanationCard(QFrame):
             f"}}"
         )
         self._hero_face.setVisible(False)
-
-        face_row = QHBoxLayout()
-        face_row.setContentsMargins(0, 0, 0, 0)
-        face_row.setSpacing(0)
-        face_row.addWidget(self._hero_face)
-        face_row.addStretch()
+        vv.addWidget(self._hero_face, 0, Qt.AlignHCenter)
 
         self._hero_sub = QLabel(
             "Detected emotional state based on facial analysis."
         )
         self._hero_sub.setWordWrap(True)
+        self._hero_sub.setAlignment(Qt.AlignCenter)
         self._hero_sub.setStyleSheet(
-            f"font-size: 11px; color: {C_DIM};"
+            f"font-size: 10px; color: {C_DIM};"
             f"background: transparent; line-height: 1.45;"
         )
+        vv.addWidget(self._hero_sub)
 
-        info.addWidget(eyebrow)
-        info.addWidget(self._hero_emotion)
-        info.addWidget(self._hero_conf)
-        info.addSpacing(4)
-        info.addLayout(face_row)
-        info.addSpacing(2)
-        info.addWidget(self._hero_sub)
-
-        hh.addLayout(info, 1)
         sv.addWidget(hero)
         return section
 
@@ -901,7 +1096,8 @@ class ExplanationCard(QFrame):
         sv = QVBoxLayout(section)
         sv.setContentsMargins(0, 0, 0, 0)
         sv.setSpacing(10)
-        sv.addWidget(self._make_section_title("AI EMOTION EXPLANATION"))
+        # Header "AI EMOTION EXPLANATION" intentionally omitted —
+        # the card's own status row ("AI EXPLANATION") is enough.
 
         card = QFrame()
         card.setObjectName("ExplCard")
@@ -944,13 +1140,9 @@ class ExplanationCard(QFrame):
 
         self._signals_grid_widget = QWidget()
         self._signals_grid_widget.setStyleSheet("QWidget { background: transparent; }")
-        self._signals_layout = QGridLayout(self._signals_grid_widget)
+        self._signals_layout = QVBoxLayout(self._signals_grid_widget)
         self._signals_layout.setContentsMargins(0, 0, 0, 0)
-        self._signals_layout.setHorizontalSpacing(10)
-        self._signals_layout.setVerticalSpacing(8)
-        self._signals_layout.setColumnStretch(0, 0)
-        self._signals_layout.setColumnStretch(1, 0)
-        self._signals_layout.setColumnStretch(2, 1)
+        self._signals_layout.setSpacing(7)
 
         cv.addWidget(self._status_label)
         cv.addWidget(self._text_label)
@@ -1287,6 +1479,7 @@ class ExplanationCard(QFrame):
             chip.setParent(None)
             chip.deleteLater()
         self._signal_chips.clear()
+        # Drain the layout (works for both QVBoxLayout and QGridLayout)
         while self._signals_layout.count():
             item = self._signals_layout.takeAt(0)
             w = item.widget()
@@ -1297,10 +1490,13 @@ class ExplanationCard(QFrame):
         emo, _ = self._tab_meta.get(self._active_tab, ("unknown", 0.0))
         signals = DETECTED_SIGNALS.get((emo or "").lower(), [])
 
-        for i, text in enumerate(signals):
-            chip = _SignalChip(text)
-            self._signals_layout.addWidget(chip, i // 2, i % 2,
-                                           Qt.AlignLeft | Qt.AlignVCenter)
+        for item in signals:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                label, tip = item[0], item[1]
+            else:
+                label, tip = str(item), ""
+            chip = _SignalChip(label, tooltip=tip)
+            self._signals_layout.addWidget(chip)
             self._signal_chips.append(chip)
 
     # ──────────────────────────────────────────
@@ -1364,8 +1560,18 @@ class ExplanationCard(QFrame):
     # ──────────────────────────────────────────
 
     def _show_and_reposition(self) -> None:
-        self.adjustSize()
-        if not self.isVisible():
+        # Only auto-size on the very first show, and never after the
+        # user has manually resized the card. Otherwise re-rendering
+        # the loader / text would stomp on the user's chosen size.
+        was_visible = self.isVisible()
+        if not was_visible and not self._user_resized:
+            # Make sure size sits inside the allowed bounds without
+            # forcing a shrink-to-fit each call.
+            target_w = max(self.CARD_MIN_WIDTH, min(self.width(), self.maximumWidth()))
+            target_h = max(self.CARD_MIN_HEIGHT, min(self.height(), self.maximumHeight()))
+            self.resize(target_w, target_h)
+
+        if not was_visible:
             parent = self.parentWidget()
             if parent is not None:
                 pr = parent.rect()
@@ -1376,18 +1582,64 @@ class ExplanationCard(QFrame):
         self.raise_()
 
     # ──────────────────────────────────────────
-    # Dragging — click anywhere on the card to drag it
+    # Dragging + resizing
+    #   • bottom-right corner (RESIZE_HANDLE_PX) → resize
+    #   • anywhere else      → drag to move
     # ──────────────────────────────────────────
+
+    def _is_in_resize_zone(self, pos: QPoint) -> bool:
+        r = self.rect()
+        zone = self.RESIZE_HANDLE_PX
+        return (
+            pos.x() >= r.width()  - zone
+            and pos.y() >= r.height() - zone
+        )
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._drag_offset = event.globalPos() - self.mapToGlobal(QPoint(0, 0))
-            self._is_dragging = True
+            if self._is_in_resize_zone(event.pos()):
+                self._is_resizing       = True
+                self._resize_start_pos  = event.globalPos()
+                self._resize_start_size = self.size()
+                self.setCursor(Qt.SizeFDiagCursor)
+            else:
+                self._drag_offset = event.globalPos() - self.mapToGlobal(QPoint(0, 0))
+                self._is_dragging = True
+                self.setCursor(Qt.SizeAllCursor)
             event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Hover cursor: corner = resize, body = move.
+        if not (self._is_dragging or self._is_resizing):
+            if self._is_in_resize_zone(event.pos()):
+                self.setCursor(Qt.SizeFDiagCursor)
+            else:
+                self.setCursor(Qt.SizeAllCursor)
+
+        if self._is_resizing and (event.buttons() & Qt.LeftButton):
+            delta = event.globalPos() - self._resize_start_pos
+            start = self._resize_start_size
+            new_w = max(
+                self.minimumWidth(),
+                min(self.maximumWidth(),  start.width()  + delta.x()),
+            )
+            new_h = max(
+                self.minimumHeight(),
+                min(self.maximumHeight(), start.height() + delta.y()),
+            )
+            # Don't run off the parent overlay either.
+            parent = self.parentWidget()
+            if parent is not None:
+                pr = parent.rect()
+                new_w = min(new_w, max(self.minimumWidth(),  pr.width()  - self.x()))
+                new_h = min(new_h, max(self.minimumHeight(), pr.height() - self.y()))
+            self.resize(new_w, new_h)
+            self._user_resized = True
+            event.accept()
+            return
+
         if self._is_dragging and (event.buttons() & Qt.LeftButton):
             new_global = event.globalPos() - self._drag_offset
             parent = self.parentWidget()
@@ -1400,12 +1652,14 @@ class ExplanationCard(QFrame):
             else:
                 self.move(new_global)
             event.accept()
-        else:
-            super().mouseMoveEvent(event)
+            return
+
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._is_dragging = False
+            self._is_resizing = False
             event.accept()
         else:
             super().mouseReleaseEvent(event)

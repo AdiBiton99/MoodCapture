@@ -1,0 +1,143 @@
+{
+  "n_samples": 700,
+  "labels": [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "neutral",
+    "sad",
+    "surprise"
+  ],
+  "accuracy": 0.5271,
+  "per_class": {
+    "angry": {
+      "precision": 0.3878,
+      "recall": 0.38,
+      "f1": 0.3838,
+      "support": 100
+    },
+    "disgust": {
+      "precision": 0.9286,
+      "recall": 0.39,
+      "f1": 0.5493,
+      "support": 100
+    },
+    "fear": {
+      "precision": 0.4194,
+      "recall": 0.26,
+      "f1": 0.321,
+      "support": 100
+    },
+    "happy": {
+      "precision": 0.6754,
+      "recall": 0.77,
+      "f1": 0.7196,
+      "support": 100
+    },
+    "neutral": {
+      "precision": 0.4024,
+      "recall": 0.68,
+      "f1": 0.5056,
+      "support": 100
+    },
+    "sad": {
+      "precision": 0.4265,
+      "recall": 0.58,
+      "f1": 0.4915,
+      "support": 100
+    },
+    "surprise": {
+      "precision": 0.7975,
+      "recall": 0.63,
+      "f1": 0.7039,
+      "support": 100
+    }
+  },
+  "averages": {
+    "macro": {
+      "precision": 0.5768,
+      "recall": 0.5271,
+      "f1": 0.525
+    },
+    "weighted": {
+      "precision": 0.5768,
+      "recall": 0.5271,
+      "f1": 0.525
+    }
+  },
+  "confusion_matrix": [
+    [
+      38,
+      2,
+      5,
+      11,
+      27,
+      15,
+      2
+    ],
+    [
+      32,
+      39,
+      5,
+      3,
+      12,
+      7,
+      2
+    ],
+    [
+      9,
+      0,
+      26,
+      9,
+      22,
+      26,
+      8
+    ],
+    [
+      7,
+      0,
+      0,
+      77,
+      10,
+      5,
+      1
+    ],
+    [
+      3,
+      0,
+      2,
+      6,
+      68,
+      20,
+      1
+    ],
+    [
+      4,
+      1,
+      8,
+      4,
+      23,
+      58,
+      2
+    ],
+    [
+      5,
+      0,
+      16,
+      4,
+      7,
+      5,
+      63
+    ]
+  ],
+  "classification_report": "              precision    recall  f1-score   support\n\n       angry       0.39      0.38      0.38       100\n     disgust       0.93      0.39      0.55       100\n        fear       0.42      0.26      0.32       100\n       happy       0.68      0.77      0.72       100\n     neutral       0.40      0.68      0.51       100\n         sad       0.43      0.58      0.49       100\n    surprise       0.80      0.63      0.70       100\n\n    accuracy                           0.53       700\n   macro avg       0.58      0.53      0.52       700\nweighted avg       0.58      0.53      0.52       700\n",
+  "dataset_dir": "data/fer2013",
+  "split": "test",
+  "source": "crops",
+  "mode": "ensemble",
+  "ensemble_weight": 0.15,
+  "finetuned_path": "models/finetuned_emotion.keras",
+  "skipped_samples": 0,
+  "requested_samples": 700
+}

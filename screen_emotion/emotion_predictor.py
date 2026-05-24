@@ -130,10 +130,12 @@ class EmotionPredictor:
         מנבא רגש מתמונת פנים חתוכה.
 
         שלבים:
-            1. יישור פנים לפי נקודות עיניים (אם סופק)
-            2. הכנת התמונה לפורמט הדרוש
-            3. ניבוי (DeepFace או מודל מותאם)
-            4. תיקון הטיה + נרמול
+            1. יישור פנים לפי נקודות עיניים (אם סופק) — חייב להתבצע *לפני*
+               שינוי גודל, כי נקודות העיגון נמצאות בקואורדינטות המקור.
+            2. נרמול גודל לערך קבוע — שומר על יציבות ניבוי בלי קשר לגודל
+               הפנים שזוהו במסך.
+            3. הכנה לפורמט (RGB/אפור, uint8) לפי המודל היעד.
+            4. ניבוי + תיקון הטיה.
 
         פרמטרים:
             face_image — numpy array של פנים חתוכות (RGB)
@@ -145,10 +147,13 @@ class EmotionPredictor:
             (emotion_name, confidence, all_emotions)
             למשל: ("happy", 0.92, {"happy": 0.92, "sad": 0.03, ...})
         """
-        prepared = self._prepare_image(face_image, grayscale=self._use_custom)
-
+        # 1. align in original coordinate space (uses raw landmarks).
+        img = face_image
         if landmarks:
-            prepared = self._align_face(prepared, landmarks)
+            img = self._align_face(img, landmarks)
+
+        # 2. normalize size — see _prepare_image.
+        prepared = self._prepare_image(img, grayscale=self._use_custom)
 
         if self._use_custom:
             return self._predict_custom(prepared)
@@ -230,28 +235,39 @@ class EmotionPredictor:
         confidence = all_emotions[dominant]
         return dominant, confidence, all_emotions
 
-    @staticmethod
-    def _prepare_image(face_image: np.ndarray, grayscale: bool = False) -> np.ndarray:
+    # Target size for normalized face crops — chosen as 224x224 (the most
+    # common input size for face-recognition CNNs). All face crops are
+    # resized to this size *before* being passed to the prediction model
+    # so the model sees a consistent input regardless of how big the face
+    # was on the screen. This eliminates resolution-dependent flips
+    # (e.g. "Happy 81%" at one zoom level vs "Fear 50%" at another).
+    TARGET_SIZE = 224
+
+    @classmethod
+    def _prepare_image(cls, face_image: np.ndarray, grayscale: bool = False) -> np.ndarray:
         """
         מכין תמונת פנים לניבוי:
-            — המרת גווני אפור ל-RGB (או ההפך לפי מצב)
-            — מוודא uint8
-            — הגדלת תמונות קטנות מדי לפחות 96×96
+            1. המרה לפורמט הצבע הנכון (RGB ל-DeepFace, אפור למודל מותאם).
+            2. הבטחת dtype = uint8.
+            3. שינוי גודל קבוע ל-TARGET_SIZE×TARGET_SIZE — קריטי ליציבות
+               ניבוי בין רזולוציות שונות.
 
-        פרמטרים:
-            grayscale — True = פלט בגווני אפור (למודל מותאם)
-                        False = פלט RGB (ל-DeepFace)
+        למה גודל קבוע?
+            DeepFace ממירה פנימית ל-48×48. אם הקלט גדול מאוד
+            (למשל 500×500 בצילום של תמונה מוגדלת), הירידה ל-48×48
+            יוצרת ארטיפקטי aliasing קשים. אם הקלט קטן יותר (למשל
+            120×120), הירידה היא עדינה ויציבה. כדי שהמודל יראה תמיד
+            אותו דבר בלי קשר לגודל הפנים על המסך, אנחנו מקטינים תחילה
+            ל-224×224 עם INTER_AREA (אנטי-aliased).
         """
         img = face_image.copy()
 
         if grayscale:
-            # המרה לגווני אפור אם צבעוני
             if img.ndim == 3 and img.shape[2] == 3:
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             elif img.ndim == 3 and img.shape[2] == 1:
                 img = img[:, :, 0]
         else:
-            # המרה ל-RGB אם גווני אפור
             if img.ndim == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             elif img.ndim == 3 and img.shape[2] == 1:
@@ -260,11 +276,18 @@ class EmotionPredictor:
         if img.dtype != np.uint8:
             img = (img * 255).clip(0, 255).astype(np.uint8)
 
-        # הגדלת תמונות קטנות — משפר דיוק על פנים קטנות
+        # Resolution normalization — always end up at TARGET_SIZE×TARGET_SIZE.
         h, w = img.shape[:2]
-        if h < 96 or w < 96:
-            scale = max(96 / h, 96 / w)
-            img   = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        if h != cls.TARGET_SIZE or w != cls.TARGET_SIZE:
+            # INTER_AREA is anti-aliased and best for downscaling;
+            # INTER_CUBIC reconstructs detail better when upscaling.
+            scale_factor = cls.TARGET_SIZE / max(h, w)
+            interp = cv2.INTER_AREA if scale_factor < 1.0 else cv2.INTER_CUBIC
+            img = cv2.resize(
+                img,
+                (cls.TARGET_SIZE, cls.TARGET_SIZE),
+                interpolation=interp,
+            )
 
         return img
 

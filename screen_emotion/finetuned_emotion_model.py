@@ -50,9 +50,77 @@ class FinetunedEmotionModel:
         import tensorflow as tf
         from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 
-        self._model = tf.keras.models.load_model(model_path)
+        self._model = self._load_with_compat(tf, model_path)
         self._preprocess_input = preprocess_input
         print("מודל Fine-tuned נטען בהצלחה.")
+
+    # ----------------------------------------------------------------------
+    # Backwards-compatible loader
+    # ----------------------------------------------------------------------
+
+    @staticmethod
+    def _load_with_compat(tf, model_path: str):
+        """
+        Loads a Keras model with tolerance for stale `BatchNormalization`
+        kwargs (`renorm`, `renorm_clipping`, `renorm_momentum`) that newer
+        Keras versions no longer accept.
+
+        The fine-tuned MobileNetV2 model was saved with an older Keras
+        that wrote these kwargs to the model config. Newer Keras refuses
+        the file outright. We monkey-patch the BatchNormalization class
+        for the duration of the load to silently drop the obsolete kwargs.
+
+        We also pass `compile=False` — we only need the model for
+        inference, and that skips deserialising the old optimiser config
+        (which can also break across versions).
+        """
+        try:
+            return tf.keras.models.load_model(model_path, compile=False)
+        except (TypeError, ValueError) as first_exc:
+            msg = str(first_exc).lower()
+            if "renorm" not in msg and "batchnormalization" not in msg:
+                raise
+
+        # ---------------------------------------------------------------
+        # Retry path: monkey-patch BatchNormalization.__init__ to strip
+        # the obsolete kwargs. We do this in-place so the deserializer
+        # (which looks up keras.layers.BatchNormalization by full module
+        # path and therefore ignores `custom_objects`) reaches our
+        # patched class.
+        # ---------------------------------------------------------------
+        print(
+            "[finetuned] retrying load with monkey-patched BatchNormalization "
+            "(stripping obsolete renorm kwargs)..."
+        )
+
+        _OBSOLETE_BN_KWARGS = ("renorm", "renorm_clipping", "renorm_momentum")
+        BN_cls = tf.keras.layers.BatchNormalization
+        original_init = BN_cls.__init__
+        original_from_config = BN_cls.from_config
+
+        def _patched_init(self, *args, **kwargs):
+            for key in _OBSOLETE_BN_KWARGS:
+                kwargs.pop(key, None)
+            return original_init(self, *args, **kwargs)
+
+        @classmethod
+        def _patched_from_config(cls, config):
+            config = dict(config or {})
+            for key in _OBSOLETE_BN_KWARGS:
+                config.pop(key, None)
+            return original_from_config.__func__(cls, config)
+
+        BN_cls.__init__    = _patched_init
+        BN_cls.from_config = _patched_from_config
+        try:
+            return tf.keras.models.load_model(
+                model_path,
+                compile=False,
+                safe_mode=False,
+            )
+        finally:
+            BN_cls.__init__    = original_init
+            BN_cls.from_config = original_from_config
 
     def predict(self, face_image: np.ndarray, landmarks: dict | None = None) -> tuple:
         """
@@ -65,12 +133,20 @@ class FinetunedEmotionModel:
         מחזיר:
             (emotion, confidence, all_emotions)
         """
-        prepared = self._prepare_image(face_image)
-
+        # Align in the original coordinate space (uses raw landmarks),
+        # THEN resize. Doing it in this order keeps the eye-line angle
+        # accurate regardless of how big the face was on screen.
+        prepared = face_image
         if landmarks:
             prepared = self._align_face(prepared, landmarks)
+        prepared = self._prepare_image(prepared)
 
-        resized = cv2.resize(prepared, (_INPUT_SIZE, _INPUT_SIZE), interpolation=cv2.INTER_CUBIC)
+        # Use INTER_AREA when downscaling (anti-aliased) and INTER_CUBIC
+        # when upscaling. Picking the right kernel is the difference
+        # between stable and resolution-dependent predictions.
+        h, w = prepared.shape[:2]
+        interp = cv2.INTER_AREA if max(h, w) > _INPUT_SIZE else cv2.INTER_CUBIC
+        resized = cv2.resize(prepared, (_INPUT_SIZE, _INPUT_SIZE), interpolation=interp)
         tensor = self._preprocess_input(resized.astype(np.float32))
         tensor = np.expand_dims(tensor, axis=0)
 
