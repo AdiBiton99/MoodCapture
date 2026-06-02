@@ -74,16 +74,30 @@ def build_analysis_service(
     finetuned_path: str = DEFAULT_FINETUNED_MODEL_PATH,
 ) -> EmotionAnalysisService:
     """יוצר EmotionAnalysisService עם המודל הנבחר."""
-    preprocessor = ImagePreprocessor()
+    preprocessor  = ImagePreprocessor()
     face_detector = MTCNNFaceDetector()
-    aggregator = MultiFaceEmotionAggregator()
+    aggregator    = MultiFaceEmotionAggregator()
     emotion_model = build_emotion_model(mode, ensemble_weight, finetuned_path)
+
+    # Optional facial-feature extractor for landmark-based XAI explanations.
+    feature_extractor = None
+    try:
+        from screen_emotion.facial_feature_extractor import FacialFeatureExtractor
+        feature_extractor = FacialFeatureExtractor()
+        if feature_extractor.is_available():
+            print("Facial feature extraction: MediaPipe Face Mesh enabled")
+        else:
+            print("Facial feature extraction: MediaPipe unavailable — install with: pip install mediapipe")
+            feature_extractor = None
+    except Exception as exc:
+        print(f"Facial feature extraction: init failed ({exc})")
 
     return EmotionAnalysisService(
         preprocessor=preprocessor,
         face_detector=face_detector,
         emotion_model=emotion_model,
         aggregator=aggregator,
+        feature_extractor=feature_extractor,
     )
 
 
@@ -172,8 +186,12 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
         }
 
     def _explain_target(target_id: str, results: dict, *,
-                        openai_service_override=None) -> str:
-        """Synchronously generate the explanation for a given tab target."""
+                        openai_service_override=None) -> tuple[str, bool, list]:
+        """
+        Synchronously generate the explanation for a given tab target.
+        Returns (text, visual_signals_available, signals).
+        signals is a list of (label, tooltip) tuples for UI chips.
+        """
         svc = (EmotionExplanationService(openai_service=openai_service_override)
                if openai_service_override is not None
                else explanation_service)
@@ -183,12 +201,13 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
             idx = int(target_id.split(":", 1)[1])
             face = results["faces"][idx]
         except (KeyError, IndexError, ValueError):
-            return "The selected face is no longer available."
+            return "The selected face is no longer available.", False, []
         return svc.explain_face(face, _face_context(results, idx))
 
     class _ExplainWorker(QThread):
-        finished_text = pyqtSignal(int, str, str)  # seq, target_id, text
-        failed         = pyqtSignal(int, str, str)  # seq, target_id, error
+        # seq, target_id, text, visual_signals_available, signals (object = list)
+        finished_text = pyqtSignal(int, str, str, bool, object)
+        failed        = pyqtSignal(int, str, str)
 
         def __init__(self, seq: int, target_id: str, results: dict):
             super().__init__()
@@ -198,43 +217,60 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
 
         def run(self) -> None:
             try:
-                text = _explain_target(self._target_id, self._results)
+                text, visual_signals, signals = _explain_target(
+                    self._target_id, self._results
+                )
             except Exception as exc:
                 self.failed.emit(self._seq, self._target_id, str(exc))
                 return
-            self.finished_text.emit(self._seq, self._target_id, text or "")
+            self.finished_text.emit(
+                self._seq, self._target_id, text or "", visual_signals, signals
+            )
 
-    def _on_worker_done(seq: int, target_id: str, text: str) -> None:
+    def _on_worker_done(seq: int, target_id: str, text: str,
+                        visual_signals_available: bool, signals: list) -> None:
         if seq != _explain_state["seq"]:
             print(f"[ExplainAI] worker done ({target_id}) — seq stale, drop")
             return  # superseded by a newer capture
         if not text:
             print(f"[ExplainAI] worker done ({target_id}) — empty text, skip")
             return
-        _explain_state["cache"][target_id] = text
+        _explain_state["cache"][target_id] = {
+            "text":                     text,
+            "visual_signals_available": visual_signals_available,
+            "signals":                  signals or [],
+        }
         active = overlay.get_active_explanation_tab()
         print(
             f"[ExplainAI] worker done → {target_id}  (active={active})  "
             f"will_update={active == target_id}  "
+            f"visual_signals={visual_signals_available}  "
+            f"landmark_signals={len(signals or [])}  "
             f"text[:60]={text[:60]!r}"
         )
         # Only refresh the body if the user is still viewing this tab.
         if active == target_id:
-            overlay.update_explanation(text)
+            overlay.update_explanation(text, visual_signals_available, signals or [])
 
     def _on_worker_failed(seq: int, target_id: str, err: str) -> None:
         if seq != _explain_state["seq"]:
             return
         print(f"[ExplainAI] worker failed ({target_id}): {err}")
-        # Use the deterministic local fallback so the user still sees a sentence.
+        # Use the deterministic local fallback so the user still sees something.
         try:
-            text = _explain_target(target_id, _explain_state["results"],
-                                   openai_service_override=None)
+            text, _, signals = _explain_target(
+                target_id, _explain_state["results"],
+                openai_service_override=None,
+            )
         except Exception:
-            text = "The explanation could not be generated for this selection."
-        _explain_state["cache"][target_id] = text
+            text, signals = "The explanation could not be generated for this selection.", []
+        _explain_state["cache"][target_id] = {
+            "text":                     text,
+            "visual_signals_available": bool(signals),
+            "signals":                  signals,
+        }
         if overlay.get_active_explanation_tab() == target_id:
-            overlay.update_explanation(text)
+            overlay.update_explanation(text, bool(signals), signals)
 
     def _watchdog_fire(seq: int, target_id: str) -> None:
         """Force the local fallback if nothing arrived in time for this tab."""
@@ -244,21 +280,32 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
             return  # already delivered
         print(f"[ExplainAI] watchdog (seq={seq}, tab={target_id}) — local fallback")
         try:
-            text = _explain_target(target_id, _explain_state["results"],
-                                   openai_service_override=None)
+            text, _, signals = _explain_target(
+                target_id, _explain_state["results"],
+                openai_service_override=None,
+            )
         except Exception as exc:
             print(f"[ExplainAI] watchdog fallback failed: {exc}")
-            text = "The explanation could not be generated in time."
-        _explain_state["cache"][target_id] = text
+            text, signals = "The explanation could not be generated in time.", []
+        _explain_state["cache"][target_id] = {
+            "text":                     text,
+            "visual_signals_available": bool(signals),
+            "signals":                  signals,
+        }
         if overlay.get_active_explanation_tab() == target_id:
-            overlay.update_explanation(text)
+            overlay.update_explanation(text, bool(signals), signals)
 
     def _request_target(target_id: str) -> None:
         """Spawn a worker for `target_id` (no-op if already cached)."""
         if target_id in _explain_state["cache"]:
             print(f"[ExplainAI] _request_target({target_id}) — cache HIT")
             if overlay.get_active_explanation_tab() == target_id:
-                overlay.update_explanation(_explain_state["cache"][target_id])
+                entry = _explain_state["cache"][target_id]
+                overlay.update_explanation(
+                    entry["text"],
+                    entry["visual_signals_available"],
+                    entry.get("signals", []),
+                )
             return
         seq = _explain_state["seq"]
         results = _explain_state["results"]
@@ -299,7 +346,12 @@ def run_with_overlay(mode: str, ensemble_weight: float, finetuned_path: str) -> 
         cached = target_id in _explain_state["cache"]
         print(f"[ExplainAI] face requested → {target_id} (cached={cached})")
         if cached:
-            overlay.update_explanation(_explain_state["cache"][target_id])
+            entry = _explain_state["cache"][target_id]
+            overlay.update_explanation(
+                entry["text"],
+                entry["visual_signals_available"],
+                entry.get("signals", []),
+            )
         else:
             overlay.show_explanation_loading()
             _request_target(target_id)

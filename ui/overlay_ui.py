@@ -1569,7 +1569,7 @@ class EmotionOverlay(QWidget):
     _sig_reset          = pyqtSignal()
     # Explainable AI Emotion Assistant — thread-safe signals
     _sig_explain_loading = pyqtSignal(str, float)
-    _sig_explain_text    = pyqtSignal(str)
+    _sig_explain_text    = pyqtSignal(str, bool, object)  # text, visual_signals, signals list
     _sig_explain_error   = pyqtSignal(str)
     _sig_explain_prepare = pyqtSignal(dict)
     # Fires AFTER results are rendered, in the MAIN thread — safe place to
@@ -1854,9 +1854,11 @@ class EmotionOverlay(QWidget):
             conf = 0.0
         self._sig_explain_loading.emit(emotion or "", conf)
 
-    def update_explanation(self, text: str) -> None:
+    def update_explanation(self, text: str,
+                           visual_signals_available: bool = False,
+                           signals: list = None) -> None:
         """Replace the card's text with the final explanation. Thread-safe."""
-        self._sig_explain_text.emit(text or "")
+        self._sig_explain_text.emit(text or "", visual_signals_available, signals or [])
 
     def show_explanation_error(self, reason: str) -> None:
         """Show a soft-error state on the card. Thread-safe."""
@@ -2404,9 +2406,12 @@ class EmotionOverlay(QWidget):
                 self._explanation.show_loading()
         self._raise_card_above_bboxes()
 
-    def _do_explain_text(self, text: str) -> None:
+    def _do_explain_text(self, text: str, visual_signals_available: bool,
+                         signals: object) -> None:
         if hasattr(self, "_explanation") and self._explanation is not None:
-            self._explanation.show_text(text)
+            self._explanation.show_text(
+                text, visual_signals_available, signals if isinstance(signals, list) else []
+            )
         self._raise_card_above_bboxes()
 
     def _do_explain_error(self, reason: str) -> None:

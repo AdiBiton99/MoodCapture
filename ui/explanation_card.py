@@ -637,6 +637,11 @@ class ExplanationCard(QFrame):
         self._active_tab:    str   = "overall"
         self._tab_meta:      dict  = {}   # tid -> (emotion, confidence)
         self._tab_color:     dict  = {}   # tid -> hex color
+        # True when visual signals exist (MediaPipe landmarks OR OpenAI Vision).
+        self._visual_signals_available: bool = False
+        # Actual detected-feature (label, tooltip) pairs for the chips.
+        # Set by show_text(); empty list = use DETECTED_SIGNALS fallback if any.
+        self._current_signals: list = []
 
         # ── Dynamic widget refs ──
         self._face_cards:   dict = {}     # tid -> _FaceMiniCard
@@ -1123,6 +1128,10 @@ class ExplanationCard(QFrame):
         self._text_label.setWordWrap(True)
         self._text_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self._text_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # Expanding/MinimumExpanding prevents the classic PyQt5 QLabel+QScrollArea
+        # clipping bug where a word-wrapped label renders at single-line height
+        # and silently hides all lines after the first.
+        self._text_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.MinimumExpanding)
         self._text_label.setStyleSheet(
             f"color: {C_TEXT};"
             f"font-size: 13px;"
@@ -1131,8 +1140,8 @@ class ExplanationCard(QFrame):
         )
         self._text_label.setFont(QFont("Segoe UI", 11))
 
-        signals_eyebrow = QLabel("DETECTED SIGNALS")
-        signals_eyebrow.setStyleSheet(
+        self._signals_eyebrow = QLabel("DETECTED SIGNALS")
+        self._signals_eyebrow.setStyleSheet(
             f"font-size: 9px; font-weight: 800;"
             f"color: {C_DIM}; letter-spacing: 1.5px;"
             f"background: transparent; padding-top: 2px;"
@@ -1147,7 +1156,7 @@ class ExplanationCard(QFrame):
         cv.addWidget(self._status_label)
         cv.addWidget(self._text_label)
         cv.addSpacing(4)
-        cv.addWidget(signals_eyebrow)
+        cv.addWidget(self._signals_eyebrow)
         cv.addWidget(self._signals_grid_widget)
 
         sv.addWidget(card)
@@ -1171,6 +1180,8 @@ class ExplanationCard(QFrame):
             self._final_conf = float(results.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
             self._final_conf = 0.0
+        self._visual_signals_available = False
+        self._current_signals = []
         self._rebuild_meta()
         self._active_tab = "overall"
         self._refresh_face_cards()
@@ -1194,12 +1205,17 @@ class ExplanationCard(QFrame):
             return
         print(f"[card] set_active_tab: {self._active_tab!r} → {target_id!r}")
         self._active_tab = target_id
+        # Reset flags — the incoming explanation will set them correctly via show_text().
+        self._visual_signals_available = False
+        self._current_signals = []
         self._apply_active()
 
     def get_active_tab(self) -> str:
         return self._active_tab
 
     def show_loading(self, emotion: str = None, confidence: float = None) -> None:
+        self._visual_signals_available = False
+        self._current_signals = []
         if emotion is not None:
             try:
                 conf = float(confidence or 0.0)
@@ -1209,14 +1225,23 @@ class ExplanationCard(QFrame):
         self._is_loading = True
         self._loader_step = 0
         self._text_label.setText(self._loader_text())
+        self._text_label.updateGeometry()
         self._status_label.setText("GENERATING EXPLANATION")
         self._loader_timer.start()
         self._show_and_reposition()
 
-    def show_text(self, text: str) -> None:
+    def show_text(self, text: str,
+                 visual_signals_available: bool = False,
+                 signals: list = None) -> None:
         self._stop_loader()
+        self._visual_signals_available = visual_signals_available
+        self._current_signals = signals if isinstance(signals, list) else []
+        self._refresh_signals()
         cleaned = (text or "").strip() or "No explanation was generated."
         self._text_label.setText(cleaned)
+        # Force the label to recalculate its preferred height so the
+        # QScrollArea reflows and shows all lines of multi-sentence text.
+        self._text_label.updateGeometry()
         self._status_label.setText("AI EXPLANATION")
         self._show_and_reposition()
 
@@ -1474,12 +1499,11 @@ class ExplanationCard(QFrame):
     # ── Signals chips ──
 
     def _refresh_signals(self) -> None:
-        # Clear existing
+        # Clear existing chips.
         for chip in self._signal_chips:
             chip.setParent(None)
             chip.deleteLater()
         self._signal_chips.clear()
-        # Drain the layout (works for both QVBoxLayout and QGridLayout)
         while self._signals_layout.count():
             item = self._signals_layout.takeAt(0)
             w = item.widget()
@@ -1487,10 +1511,29 @@ class ExplanationCard(QFrame):
                 w.setParent(None)
                 w.deleteLater()
 
-        emo, _ = self._tab_meta.get(self._active_tab, ("unknown", 0.0))
-        signals = DETECTED_SIGNALS.get((emo or "").lower(), [])
+        # Only show DETECTED SIGNALS when real visual signals are available.
+        # In offline / distribution-only fallback mode there are no real signals —
+        # showing generic chip descriptions would be misleading.
+        if not self._visual_signals_available:
+            self._signals_eyebrow.setVisible(False)
+            self._signals_grid_widget.setVisible(False)
+            return
 
-        for item in signals:
+        self._signals_eyebrow.setVisible(True)
+        self._signals_grid_widget.setVisible(True)
+
+        # Prefer real MediaPipe landmark signals (_current_signals).
+        # Fall back to static DETECTED_SIGNALS only when the explanation came
+        # from OpenAI Vision (which provides prose but no explicit chip list).
+        if self._current_signals:
+            signals_to_show = self._current_signals
+            self._signals_eyebrow.setText("DETECTED FACIAL SIGNALS")
+        else:
+            emo, _ = self._tab_meta.get(self._active_tab, ("unknown", 0.0))
+            signals_to_show = DETECTED_SIGNALS.get((emo or "").lower(), [])
+            self._signals_eyebrow.setText("DETECTED SIGNALS")
+
+        for item in signals_to_show:
             if isinstance(item, (tuple, list)) and len(item) >= 2:
                 label, tip = item[0], item[1]
             else:

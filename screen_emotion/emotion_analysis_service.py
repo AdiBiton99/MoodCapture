@@ -31,24 +31,31 @@ class EmotionAnalysisService:
         face_detector,
         emotion_model,
         aggregator,
+        feature_extractor=None,
     ):
         """
         יצירת שירות הניתוח עם כל הרכיבים הדרושים.
 
         פרמטרים:
-            preprocessor   — אובייקט ImagePreprocessor עם מתודת process(image)
-            face_detector  — לרוב MTCNNFaceDetector עם detect(image) → list[DetectedFace]
-            emotion_model  — EmotionPredictor עם predict(...)
-            aggregator     — MultiFaceEmotionAggregator עם aggregate(predictions)
+            preprocessor      — אובייקט ImagePreprocessor עם מתודת process(image)
+            face_detector     — לרוב MTCNNFaceDetector עם detect(image) → list[DetectedFace]
+            emotion_model     — EmotionPredictor עם predict(...)
+            aggregator        — MultiFaceEmotionAggregator עם aggregate(predictions)
+            feature_extractor — FacialFeatureExtractor (optional).  When provided,
+                                facial landmark features are extracted for every
+                                detected face and stored in the result under
+                                face["features"].  May be None — the pipeline
+                                degrades gracefully to distribution-based XAI.
 
         דוגמה לשימוש:
             service = EmotionAnalysisService(preprocessor, detector, model, aggregator)
             result  = service.analyze(screenshot_image)
         """
-        self._preprocessor = preprocessor
-        self._face_detector = face_detector
-        self._emotion_model = emotion_model
-        self._aggregator = aggregator
+        self._preprocessor     = preprocessor
+        self._face_detector    = face_detector
+        self._emotion_model    = emotion_model
+        self._aggregator       = aggregator
+        self._feature_extractor = feature_extractor
 
     # ------------------------------------------------------------------
     # מתודה ראשית — הכניסה הרשמית לצינור
@@ -164,11 +171,18 @@ class EmotionAnalysisService:
             except Exception:
                 continue  # פנים כושלות — מדלגים עליהן בשקט
 
+            # Optional: extract facial landmark features for XAI explanations.
+            if self._feature_extractor is not None:
+                features = self._feature_extractor.extract(face_image)
+            else:
+                features = {}
+
             results.append({
                 "bbox":         detected_face.get_bounding_box(),
                 "prediction":   (emotion, confidence),
                 "all_emotions": all_emotions,  # {"happy": 0.72, "sad": 0.15, ...}
                 "face_image":   face_image,
+                "features":     features,
             })
 
         return results
@@ -205,6 +219,7 @@ class EmotionAnalysisService:
                     face_result["bbox"], bbox_scale_x, bbox_scale_y
                 ),
                 "face_image":   face_result.get("face_image"),
+                "features":     face_result.get("features", {}),
             })
 
         return {

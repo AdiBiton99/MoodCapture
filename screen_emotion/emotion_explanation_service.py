@@ -112,23 +112,6 @@ SYSTEM_PROMPT_FACE = (
 )
 
 
-# Used in the local fallback (no image, no API): each emotion's TYPICAL
-# facial features. Keeps the fallback educational rather than abstract.
-EMOTION_FEATURE_HINTS = {
-    "happy":    "an upturned mouth (smile), raised cheeks, and often crinkling "
-                "around the eyes",
-    "sad":      "downturned mouth corners, drooping eyelids, and inner brows "
-                "drawn up or together",
-    "angry":    "lowered, furrowed brows, tightened lips, and tense facial muscles",
-    "neutral":  "relaxed facial muscles with no strong expression in the mouth, "
-                "brows, or eyes",
-    "surprise": "raised eyebrows, widened eyes, and a parted (open) mouth",
-    "fear":     "raised and drawn-together eyebrows, widened eyes, and a "
-                "horizontally stretched mouth",
-    "disgust":  "a wrinkled nose, raised upper lip, and lowered brows",
-}
-
-
 class EmotionExplanationService:
     """
     Generates a natural-language explanation for an emotion analysis result.
@@ -151,16 +134,17 @@ class EmotionExplanationService:
     # Public API
     # ------------------------------------------------------------------
 
-    def explain(self, analysis_result: dict) -> str:
+    def explain(self, analysis_result: dict) -> tuple[str, bool, list]:
         """
         Build an explanation from an analysis-service result dict.
+
+        Returns (text, visual_signals_available, signals).
+        The overall explanation never sends a face image, so
+        visual_signals_available is always False and signals is [].
 
         Always returns a non-empty string. Order of attempts:
             1. OpenAI (if service is available)
             2. Local deterministic template
-
-        The input dict is expected to follow the shape produced by
-        EmotionAnalysisService.analyze(...).
         """
         payload = self._build_payload(analysis_result)
 
@@ -168,46 +152,66 @@ class EmotionExplanationService:
         if payload["faces_count"] == 0:
             return (
                 "No faces were detected in the captured image, so no "
-                "emotion explanation can be produced for this frame."
+                "emotion explanation can be produced for this frame.",
+                False,
+                [],
             )
 
         if self._openai is not None and self._openai.is_available():
             try:
                 text = self._openai.generate(SYSTEM_PROMPT, payload)
                 if text:
-                    return text
+                    return text, False, []
             except Exception as exc:
                 _LOGGER.warning("OpenAI explanation failed; falling back: %s", exc)
 
-        return self._local_fallback(payload)
+        return self._local_fallback(payload), False, []
 
-    def explain_face(self, face_data: dict, context: dict) -> str:
+    def explain_face(self, face_data: dict, context: dict) -> tuple[str, bool, list]:
         """
         Build an explanation focused on a SINGLE face out of the analysis.
 
-        When an OpenAI vision-capable model is available, the CROPPED FACE
-        IMAGE from `face_data["face_image"]` is sent alongside the JSON so
-        the model can describe the actual visible features (mouth, eyes,
-        eyebrows, etc.) that support the prediction. This makes the
-        explanation educational and concrete rather than abstract.
+        Returns (text, visual_signals_available, signals).
+
+        Priority order:
+            1. MediaPipe landmark features (if face_data["features"] is non-empty)
+               → feature-based explanation grounded in measured geometry
+               → visual_signals_available = True
+               → signals = list of (label, tooltip) tuples for UI chips
+            2. OpenAI Vision (if available + face_image present)
+               → visual_signals_available = (image was sent)
+               → signals = []  (plain prose from GPT, no chip list)
+            3. Local distribution-based fallback
+               → visual_signals_available = False
+               → signals = []
 
         Parameters:
             face_data — one entry from `analysis_result["faces"]`. Required
                         fields: `emotion`, `confidence`, `all_emotions`.
-                        Optional: `face_image` (np.ndarray) — enables vision.
-            context   — overall result context, typically:
-                            {
-                              "final_emotion":    str,
-                              "final_confidence": float,
-                              "faces_count":      int,
-                              "face_index":       int,
-                            }
-
-        Always returns a non-empty string. Order of attempts:
-            1. OpenAI with image (if available + face_image present)
-            2. OpenAI text-only (if image encoding failed)
-            3. Local deterministic template (educational with feature hints)
+                        Optional: `face_image` (np.ndarray), `features` (dict).
+            context   — overall result context.
         """
+        features = face_data.get("features") or {}
+
+        # ── Path 1: MediaPipe landmark features ──────────────────────────
+        if features:
+            from screen_emotion.feature_explainer import (
+                build_feature_explanation,
+                build_feature_signals,
+            )
+            payload      = self._build_face_payload(face_data, context)
+            top_emotions = payload["face"].get("top_emotions") or []
+            emotion      = face_data.get("emotion", "unknown")
+            confidence   = float(face_data.get("confidence", 0.0))
+
+            text    = build_feature_explanation(emotion, confidence, features, top_emotions)
+            signals = build_feature_signals(features, (emotion or "").lower())
+            # Only mark visual signals as available when we actually have chips to show.
+            # If features were extracted but none matched the predicted emotion, the
+            # explanation text already explains this — no chip section should appear.
+            return text, bool(signals), signals
+
+        # ── Path 2: OpenAI Vision ─────────────────────────────────────────
         payload     = self._build_face_payload(face_data, context)
         image_bytes = self._encode_face_image_png(face_data.get("face_image"))
 
@@ -220,11 +224,13 @@ class EmotionExplanationService:
                     max_tokens=400,
                 )
                 if text:
-                    return text
+                    visual_signals_available = image_bytes is not None
+                    return text, visual_signals_available, []
             except Exception as exc:
                 _LOGGER.warning("OpenAI face explanation failed; falling back: %s", exc)
 
-        return self._local_fallback_face(payload)
+        # ── Path 3: Local distribution fallback ───────────────────────────
+        return self._local_fallback_face(payload), False, []
 
     # ------------------------------------------------------------------
     # Image encoding helper
@@ -325,8 +331,8 @@ class EmotionExplanationService:
     @staticmethod
     def _local_fallback(payload: dict) -> str:
         """
-        Deterministic, hand-written explanation. Always grounded in numbers
-        from `payload`. Used whenever the OpenAI call is unavailable or fails.
+        Distribution-aware explanation for the overall analysis result.
+        Derives reasoning from probability scores — never invents visual features.
         """
         final_emotion = payload.get("final_emotion") or "unknown"
         final_conf    = float(payload.get("final_confidence", 0.0))
@@ -340,75 +346,98 @@ class EmotionExplanationService:
                 "emotion explanation can be produced for this frame."
             )
 
-        # --- per-face agreement ---------------------------------------
-        votes = [f.get("emotion") for f in faces]
-        winners = [v for v in votes if v == final_emotion]
-        agreement = len(winners) / n if n else 0.0
-
-        # --- runner-up emotion across the dominant face ---------------
+        # --- Extract top-3 from the dominant face's distribution ------
         dominant_face = next(
             (f for f in faces if f.get("emotion") == final_emotion),
             faces[0],
         )
-        top_list = dominant_face.get("top_emotions") or []
-        runner_up: Optional[dict] = None
-        for item in top_list:
-            if item.get("name") != final_emotion:
-                runner_up = item
-                break
+        top_list   = dominant_face.get("top_emotions") or []
+        top1       = top_list[0] if len(top_list) > 0 else None
+        top2       = top_list[1] if len(top_list) > 1 else None
+        top3       = top_list[2] if len(top_list) > 2 else None
+        top1_score = float(top1["score"]) if top1 else final_conf
+        top2_score = float(top2["score"]) if top2 else 0.0
+        top3_score = float(top3["score"]) if top3 else 0.0
+        gap_1_2    = top1_score - top2_score
+        conf_pct   = f"{final_conf * 100:.0f}%"
 
-        # --- compose sentences ----------------------------------------
-        conf_pct = f"{final_conf * 100:.0f}%"
-
+        # --- Sentence 1: result + confidence level --------------------
         if band == "high":
-            sentence_main = (
-                f"The system selected \"{final_emotion}\" because the detected "
-                f"face(s) showed signals consistent with {final_emotion} at a "
-                f"high confidence of {conf_pct}."
+            s_result = (
+                f'The model selected "{final_emotion}" as the dominant emotion '
+                f"with high confidence ({conf_pct})."
             )
         elif band == "medium":
-            sentence_main = (
-                f"The system selected \"{final_emotion}\" with a moderate "
-                f"confidence of {conf_pct}, indicating that the dominant "
-                f"signal was {final_emotion} but not overwhelmingly so."
+            s_result = (
+                f'The model selected "{final_emotion}" with moderate confidence '
+                f"({conf_pct}), indicating a recognisable but not overwhelming signal."
             )
         else:
-            sentence_main = (
-                f"The prediction \"{final_emotion}\" was assigned with a "
-                f"relatively low confidence of {conf_pct}, so the result "
-                f"should be treated as uncertain."
+            s_result = (
+                f'The model assigned "{final_emotion}" with low confidence '
+                f"({conf_pct}), so this prediction should be treated with caution."
             )
 
-        sentence_runner = ""
-        if runner_up and runner_up.get("score", 0.0) > 0.05:
-            sentence_runner = (
-                f" The next strongest signal was \"{runner_up['name']}\" "
-                f"at {runner_up['score'] * 100:.0f}%, which the model "
-                f"considered but did not select."
+        # --- Sentence 2: distribution reasoning ----------------------
+        s_dist = ""
+        if top2:
+            three_way = (
+                top3 is not None
+                and top2_score >= top1_score - 0.10
+                and top3_score >= top1_score - 0.15
             )
-
-        sentence_faces = ""
-        if n > 1:
-            if agreement >= 0.99:
-                sentence_faces = (
-                    f" All {n} detected faces agreed on {final_emotion}, "
-                    f"which reinforced the final decision."
+            if three_way:
+                s_dist = (
+                    f'The model shows uncertainty: "{top1["name"]}" ({top1_score * 100:.0f}%), '
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%), and '
+                    f'"{top3["name"]}" ({top3_score * 100:.0f}%) all received comparable scores, '
+                    f"indicating the expression carries mixed signals."
                 )
-            elif agreement >= 0.5:
-                disagreeing = n - len(winners)
-                sentence_faces = (
-                    f" Of the {n} detected faces, {len(winners)} aligned with "
-                    f"{final_emotion} while {disagreeing} showed different "
-                    f"signals; the final emotion reflects the dominant pattern."
+            elif gap_1_2 < 0.10:
+                s_dist = (
+                    f'The small gap between "{final_emotion}" ({top1_score * 100:.0f}%) and '
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%) indicates ambiguity '
+                    f"in the facial expression signal."
+                )
+            elif gap_1_2 > 0.25:
+                s_dist = (
+                    f'The prediction is considered reliable because "{final_emotion}" '
+                    f"({top1_score * 100:.0f}%) clearly exceeds all alternatives — "
+                    f'the next-highest emotion, "{top2["name"]}", scored only '
+                    f"{top2_score * 100:.0f}%. This large gap supports a strong prediction."
                 )
             else:
-                sentence_faces = (
-                    f" The {n} detected faces produced mixed signals, and "
-                    f"\"{final_emotion}\" was chosen as the most frequently "
-                    f"observed emotion across them."
+                s_dist = (
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%) was the second-ranked '
+                    f'emotion, which the model considered but ranked below "{final_emotion}".'
                 )
 
-        return (sentence_main + sentence_runner + sentence_faces).strip()
+        # --- Sentence 3: multi-face agreement ------------------------
+        s_faces = ""
+        if n > 1:
+            votes    = [f.get("emotion") for f in faces]
+            winners  = [v for v in votes if v == final_emotion]
+            agree_n  = len(winners)
+            disagree = n - agree_n
+            if agree_n == n:
+                s_faces = (
+                    f'All {n} detected faces agreed on "{final_emotion}", '
+                    f"reinforcing the final decision."
+                )
+            elif agree_n >= n / 2:
+                s_faces = (
+                    f"Of the {n} detected faces, {agree_n} aligned with "
+                    f'"{final_emotion}" while {disagree} showed different signals; '
+                    f"the final emotion reflects the dominant pattern."
+                )
+            else:
+                s_faces = (
+                    f"The {n} detected faces produced mixed signals; "
+                    f'"{final_emotion}" was chosen as the most frequently observed emotion.'
+                )
+
+        parts = [s_result, s_dist, s_faces]
+        return " ".join(p for p in parts if p).strip()
 
     # ------------------------------------------------------------------
     # Per-face payload + fallback
@@ -462,89 +491,95 @@ class EmotionExplanationService:
     @staticmethod
     def _local_fallback_face(payload: dict) -> str:
         """
-        Deterministic, educational fallback for a single-face explanation.
-        Used when OpenAI is unavailable or fails. Cannot see the actual
-        face, so it instead describes the TYPICAL features associated with
-        the predicted emotion — useful for the reader to learn from.
+        Distribution-aware fallback for a single-face explanation.
+        Used when OpenAI Vision is unavailable or fails.
+        Derives reasoning from probability scores only — never invents
+        or infers any visual facial features.
         """
-        face       = payload.get("face") or {}
-        context    = payload.get("context") or {}
-        face_label = "This face"   # No "Face N" labels — see SYSTEM_PROMPT_FACE.
+        face    = payload.get("face") or {}
+        context = payload.get("context") or {}
 
-        emotion    = (face.get("emotion") or "unknown").lower()
-        conf       = float(face.get("confidence", 0.0))
-        conf_pct   = f"{conf * 100:.0f}%"
-        band       = context.get("confidence_band", "medium")
+        emotion  = (face.get("emotion") or "unknown").lower()
+        conf     = float(face.get("confidence", 0.0))
+        conf_pct = f"{conf * 100:.0f}%"
+        band     = context.get("confidence_band", "medium")
 
-        feature_hint = EMOTION_FEATURE_HINTS.get(emotion)
+        top_list   = face.get("top_emotions") or []
+        top1       = top_list[0] if len(top_list) > 0 else None
+        top2       = top_list[1] if len(top_list) > 1 else None
+        top3       = top_list[2] if len(top_list) > 2 else None
+        top1_score = float(top1["score"]) if top1 else conf
+        top2_score = float(top2["score"]) if top2 else 0.0
+        top3_score = float(top3["score"]) if top3 else 0.0
+        gap_1_2    = top1_score - top2_score
 
-        top_emotions = face.get("top_emotions") or []
-        runner_up: Optional[dict] = None
-        for item in top_emotions:
-            if item.get("name") != face.get("emotion"):
-                runner_up = item
-                break
-
-        # --- main sentence: ties the predicted emotion to TYPICAL features ---
-        if feature_hint:
-            if band == "high":
-                main = (
-                    f"{face_label} was classified as \"{emotion}\" with a high "
-                    f"confidence of {conf_pct}. {emotion.capitalize()} is "
-                    f"typically expressed through {feature_hint}, and the "
-                    f"model identified these features strongly in this face."
-                )
-            elif band == "medium":
-                main = (
-                    f"{face_label} was classified as \"{emotion}\" with a "
-                    f"moderate confidence of {conf_pct}. {emotion.capitalize()} "
-                    f"is typically expressed through {feature_hint}, and the "
-                    f"model detected these features here, although not "
-                    f"overwhelmingly."
-                )
-            else:
-                main = (
-                    f"{face_label} was classified as \"{emotion}\" with a "
-                    f"relatively low confidence of {conf_pct}, so this "
-                    f"prediction should be treated as uncertain. "
-                    f"{emotion.capitalize()} is typically expressed through "
-                    f"{feature_hint}, but in this face the signal was weak."
-                )
+        # --- Sentence 1: result + confidence level --------------------
+        if band == "high":
+            s_result = (
+                f'The model classified this face as "{emotion}" '
+                f"with high confidence ({conf_pct})."
+            )
+        elif band == "medium":
+            s_result = (
+                f'The model classified this face as "{emotion}" '
+                f"with moderate confidence ({conf_pct})."
+            )
         else:
-            # Unknown emotion — fall back to a generic phrasing.
-            main = (
-                f"{face_label} was classified as \"{emotion}\" with a "
-                f"confidence of {conf_pct}, based on signals the model "
-                f"associates with that emotion."
+            s_result = (
+                f'The model classified this face as "{emotion}" with a low '
+                f"confidence of {conf_pct}, so this prediction should be treated as uncertain."
             )
 
-        runner_sentence = ""
-        if runner_up and runner_up.get("score", 0.0) > 0.05:
-            runner_name = runner_up["name"]
-            runner_pct  = f"{runner_up['score'] * 100:.0f}%"
-            runner_hint = EMOTION_FEATURE_HINTS.get(runner_name.lower())
-            if runner_hint:
-                runner_sentence = (
-                    f" A secondary signal of \"{runner_name}\" "
-                    f"({runner_pct}) was also detected — {runner_name} "
-                    f"is associated with {runner_hint}, hinting that subtle "
-                    f"elements of this expression were present too."
+        # --- Sentence 2: distribution reasoning ----------------------
+        s_dist = ""
+        if top2:
+            three_way = (
+                top3 is not None
+                and top2_score >= top1_score - 0.10
+                and top3_score >= top1_score - 0.15
+            )
+            if three_way:
+                s_dist = (
+                    f"The model is uncertain because several emotions received similar "
+                    f'scores: "{top1["name"]}" at {top1_score * 100:.0f}%, '
+                    f'"{top2["name"]}" at {top2_score * 100:.0f}%, and '
+                    f'"{top3["name"]}" at {top3_score * 100:.0f}%. '
+                    f"This spread indicates the facial expression carries ambiguous signals."
+                )
+            elif gap_1_2 < 0.10:
+                s_dist = (
+                    f'The small difference between "{emotion}" ({top1_score * 100:.0f}%) and '
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%) indicates ambiguity '
+                    f"in the expression signal."
+                )
+            elif gap_1_2 > 0.25:
+                s_dist = (
+                    f'The large gap between "{emotion}" ({top1_score * 100:.0f}%) and '
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%) suggests a clear '
+                    f"emotional signal, supporting a reliable prediction."
                 )
             else:
-                runner_sentence = (
-                    f" The next strongest signal for this face was "
-                    f"\"{runner_name}\" at {runner_pct}."
+                s_dist = (
+                    f'"{top2["name"]}" ({top2_score * 100:.0f}%) was the second-ranked '
+                    f"emotion, which the model considered but did not select."
                 )
 
-        group_sentence = ""
+        # --- Sentence 3: offline note ---------------------------------
+        s_offline = (
+            "Because OpenAI Vision is unavailable, this explanation is based "
+            "solely on the model's probability distribution, not on visible facial features."
+        )
+
+        # --- Sentence 4: group context --------------------------------
+        s_group = ""
         final_emotion = context.get("final_emotion")
         agrees        = context.get("agrees_with_overall", True)
         faces_count   = int(context.get("faces_count", 1) or 1)
         if faces_count > 1 and final_emotion and not agrees:
-            group_sentence = (
-                f" Note that the overall result for the image was "
-                f"\"{final_emotion}\", so this face stood out from "
-                f"the rest of the group."
+            s_group = (
+                f'Note that the overall result for the image was "{final_emotion}", '
+                f"so this face showed a different emotional signal from the rest of the group."
             )
 
-        return (main + runner_sentence + group_sentence).strip()
+        parts = [s_result, s_dist, s_offline, s_group]
+        return " ".join(p for p in parts if p).strip()
